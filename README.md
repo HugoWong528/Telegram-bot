@@ -1,131 +1,124 @@
-# AI Discord Bot
+# AI Telegram Bot
 
-This repository offers a **unified bot** that combines general AI chat, multi-role company discussions, autonomous code generation, code review, and **Hong Kong weather reminders** into a **single Discord bot token**.  The legacy individual bots are kept for backwards compatibility.
+This repository provides a **unified Telegram bot** that combines general AI chat, multi-role company discussions, autonomous code generation, code review, and **Hong Kong weather reminders** — all powered by [Pollinations AI](https://pollinations.ai).
 
-| Mode | Entry point | Description |
-|---|---|---|
-| 🤖 **Unified Bot** (recommended) | [`bot.py`](bot.py) | Single bot — one `DISCORD_TOKEN` covers all features below |
-| 🗨️ **General Chat only** | [`general-chat/bot.py`](general-chat/bot.py) | Streaming AI replies to mentions/DMs |
-| 🏢 **AI Company only** | [`ai-company/bot.py`](ai-company/bot.py) | Company discussions, `/build`, `/autorun` |
+One `TELEGRAM_TOKEN` is all you need.
 
-All bots are powered by [Pollinations AI](https://pollinations.ai) and run on Python 3.11.
-
-For platform-specific deployment instructions (Linux/VPS, macOS, Windows, Docker, GitHub Actions, Railway, Render, Fly.io, Heroku, Oracle Cloud) see **[PLATFORM.md](PLATFORM.md)**.  
-For Vercel and always-on hosting see **[VERCEL.md](VERCEL.md)**.  
-For Railway.com (easiest always-on) see **[RAILWAY.md](RAILWAY.md)**.
+For **Railway** deployment (recommended always-on hosting) see **[RAILWAY.md](RAILWAY.md)**.  
+For other platforms (Linux/VPS, Docker, macOS, Windows, GitHub Actions) see **[PLATFORM.md](PLATFORM.md)**.
 
 ---
 
 ## What's New
 
-- **Unified single-token bot** — run `bot.py` at the root with one `DISCORD_TOKEN`
-- **Automatic code review** — after `/build` or `/autorun` generates code, a Code Reviewer AI checks for critical issues and automatically regenerates if needed (up to 2 rounds)
-- **Automatic format retry** — if the AI output doesn't contain `### File:` blocks, the bot retries up to 3 times before giving up
-- **Universal `/followup`** — replaces both `/interrupt` and the old `/followup`; it automatically detects context:
-  - If an AI stream is in progress → cancels it and redirects with your input
-  - If a `/build` or `/autorun` session exists → builds follow-up (amend code, ask questions); **supports unlimited chained follow-ups**, each with full context of all prior exchanges
+- **Telegram bot** — replaced the Discord bot; works in direct messages and group chats
+- **Live streaming replies** — the bot edits its message as the AI streams tokens
+- **Automatic code review** — after `/build` or `/autorun`, a Code Reviewer AI checks for critical issues and auto-regenerates (up to 2 rounds)
+- **Universal `/followup`** — context-aware continuation:
+  - Active AI stream → cancels it and redirects with your input
+  - After `/build` / `/autorun` → build follow-up (amend code, ask questions); supports unlimited chained follow-ups
   - Otherwise → continues the general chat conversation
-- **`/weather`** — fetches current Hong Kong weather from the HKO official RSS feed and generates AI-powered clothing suggestions (Traditional Chinese + English); optional auto-reminders to a configured channel
+- **`/weather`** — fetches current Hong Kong weather from the HKO official RSS feed and generates AI-powered clothing suggestions (Traditional Chinese + English); optional auto-reminders
 
 ---
 
 ## Repository Structure
 
 ```
-AI-discord-bot/
-├── bot.py                  # ★ Unified bot — single DISCORD_TOKEN, all features
-├── requirements.txt        # Dependencies for the unified bot
-├── runtime.txt             # Python version
-├── railway.toml            # Railway deployment config (unified bot)
-├── general-chat/
-│   ├── bot.py              # General-purpose AI chat bot (standalone)
-│   └── requirements.txt
-├── ai-company/
-│   ├── bot.py              # AI company + build bot (standalone)
-│   ├── requirements.txt
-│   └── SETUP.md
-├── .github/workflows/
-│   ├── bot.yml                     # ★ Workflow: Unified bot (DISCORD_TOKEN)
-│   ├── discord-bot.yml             # Workflow: General Chat only
-│   └── discord-ai-company-bot.yml  # Workflow: AI Company only
-├── PLATFORM.md             # All platforms deployment guide
-├── VERCEL.md               # Vercel / Render deployment guide
-├── RAILWAY.md              # Railway.com deployment guide
-└── README.md
+Telegram-bot/
+├── bot.py               # ★ Unified Telegram bot — one TELEGRAM_TOKEN, all features
+├── requirements.txt     # Python dependencies
+├── runtime.txt          # Python version
+├── railway.toml         # Railway deployment config
+├── README.md
+├── RAILWAY.md           # Railway.com deployment guide
+├── PLATFORM.md          # All platforms deployment guide
+└── APIDOCS.md           # Pollinations AI API reference
 ```
 
 ---
 
-## Quick Start — Unified Bot
+## Quick Start
 
-### 1. Create a Discord Bot & Get Tokens
+### 1. Create a Telegram Bot & Get Your Token
 
-1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) → **New Application**.
-2. In **Bot** → **Reset Token** → copy your `DISCORD_TOKEN`.
-3. Enable **Message Content Intent** under **Privileged Gateway Intents**.
-4. Go to <https://enter.pollinations.ai> and copy your `POLLINATIONS_TOKEN`.
+1. Open Telegram and start a chat with **[@BotFather](https://t.me/BotFather)**.
+2. Send `/newbot` and follow the prompts (choose a name and a username ending in `bot`).
+3. BotFather will send you the bot token — copy it.  It looks like `7123456789:AAF...`.
+4. *(Optional)* Register your bot commands with BotFather:
+   ```
+   /setcommands
+   ```
+   Then paste the list from the [Commands section](#all-commands) below.
 
-### 2. Invite the Bot to Your Server
+### 2. Get a Pollinations API Key
 
-In **OAuth2 → URL Generator**:
-- **Scopes:** `bot` + `applications.commands`
-- **Bot Permissions:** `Send Messages`, `Read Messages / View Channels`, `Read Message History`, `Create Public Threads`
-
-Copy the URL and invite the bot.
+Go to <https://enter.pollinations.ai> and copy your `POLLINATIONS_TOKEN`.
 
 ### 3. Run Locally
 
 ```bash
-git clone https://github.com/HugoWong528/AI-discord-bot.git
-cd AI-discord-bot
+git clone https://github.com/HugoWong528/Telegram-bot.git
+cd Telegram-bot
 
 pip install -r requirements.txt
 
-export DISCORD_TOKEN="your_discord_bot_token"
+export TELEGRAM_TOKEN="your_telegram_bot_token"
 export POLLINATIONS_TOKEN="your_pollinations_api_key"
 # Optional — needed for /build to commit generated code:
 # export GITHUB_TOKEN="your_github_pat"
 # export GITHUB_REPOSITORY="owner/repo"
 # Optional — auto weather reminders (Hong Kong):
-# export WEATHER_CHANNEL_ID="your_discord_channel_id"
+# export WEATHER_CHAT_ID="your_telegram_chat_id"
 # export WEATHER_REMINDER_HOURS="8,20"   # HKT hours to post (default: 8)
 
 python bot.py
 ```
 
-### 4. GitHub Actions (zero infrastructure)
+### 4. Deploy on Railway (Recommended)
 
-Add repository secrets (Settings → Secrets → Actions):
-
-| Secret | Value |
-|---|---|
-| `DISCORD_TOKEN` | Your Discord bot token |
-| `POLLINATIONS_TOKEN` | Your Pollinations API key |
-
-Then go to **Actions → Unified AI Discord Bot → Run workflow**.
+Railway is the easiest way to keep your bot running 24/7.  See **[RAILWAY.md](RAILWAY.md)** for a step-by-step guide.
 
 ---
 
-## All Slash Commands (Unified Bot)
+## All Commands
+
+Register these with BotFather via `/setcommands`:
+
+```
+start - Show the help guide
+about - Show the full help guide
+ask - Ask the AI a question (live streaming)
+cancel - Cancel your in-progress AI request
+models - List all available AI models
+settings - View or set your preferred AI model
+company - Run a multi-role AI company discussion
+build - Developer team discussion + code generation
+autorun - Fully autonomous build (AI picks the task)
+company_roles - List all available roles
+followup - Context-aware continuation
+weather - Current HK weather + AI clothing suggestions
+```
 
 ### General Chat
 
 | Command | Description |
 |---|---|
-| `/ask question:[…] model:[optional]` | Ask the AI; response streams live to Discord |
+| `/ask <question>` | Ask the AI; response streams live |
+| `/ask model:<name> <question>` | Ask with a specific model |
 | `/cancel` | Cancel your current in-progress AI request |
 | `/models` | List all available AI models |
-| `/settings model:[optional]` | View or set your preferred AI model |
+| `/settings <model>` | Set your preferred AI model |
 | `/about` | Show the full help guide |
 
 ### AI Company / Build
 
 | Command | Description |
 |---|---|
-| `/company task:[…]` | Multi-role AI company discussion |
-| `/company task:[…] roles:[r1,r2,…] interactive:True` | Customised + interactive |
-| `/build task:[…]` | Developer team discussion + code gen + GitHub commit |
-| `/build task:[…] roles:[…] interactive:True` | Customised build + interactive |
+| `/company <task>` | Multi-role AI company discussion |
+| `/company <task> roles:CEO,CTO,Designer interactive:true` | Interactive mode |
+| `/build <task>` | Developer team discussion + code gen + GitHub commit |
+| `/build <task> roles:... interactive:true` | Interactive build |
 | `/autorun` | Fully autonomous: AI picks task + builds end-to-end |
 | `/autorun stack:python` | Force a specific tech stack |
 | `/company_roles` | List all available roles |
@@ -140,26 +133,24 @@ Then go to **Actions → Unified AI Discord Bot → Run workflow**.
 
 | Command | Description |
 |---|---|
-| `/followup request:[…]` | **Context-aware**: redirects an active stream, continues a build session (chained), or adds to general chat |
+| `/followup <request>` | **Context-aware**: redirects an active stream, continues a build session, or adds to general chat |
 
 ---
 
 ## How /followup Works
 
-`/followup` is the single command for all "continue the conversation" needs — no need to remember whether to use `/interrupt` or `/followup`:
+`/followup` is the single command for all "continue the conversation" needs:
 
-1. **If an AI stream is running** → cancels it and redirects with your input (like the old `/interrupt`)
-2. **If a `/build` or `/autorun` session exists in this channel** → build follow-up: amend code, ask questions, generate new files and commit them.  You can chain as many follow-ups as you like — each one sees the **full history** of all prior exchanges.
+1. **If an AI stream is running** → cancels it and redirects with your input
+2. **If a `/build` or `/autorun` session exists in this chat** → build follow-up: amend code, ask questions, generate new files and commit them.  You can chain as many follow-ups as you like.
 3. **Any other time** → general chat follow-up: adds your message to the conversation history and gets a streaming AI reply
 
 ```
-/followup request:Add JWT authentication to the API
-/followup request:Now add rate limiting to the auth routes
-/followup request:Can you write unit tests for the middleware?
-/followup request:Actually, make the tests use pytest-asyncio
+/followup Add JWT authentication to the API
+/followup Now add rate limiting to the auth routes
+/followup Can you write unit tests for the middleware?
+/followup Actually, make the tests use pytest-asyncio
 ```
-
-Each follow-up builds on every previous one.  You can also **interrupt a follow-up that is mid-stream** by issuing another `/followup` — it cancels the in-progress response and immediately starts the new one.
 
 ---
 
@@ -177,69 +168,21 @@ Set two environment variables to have the bot post a weather report automaticall
 
 | Variable | Description |
 |---|---|
-| `WEATHER_CHANNEL_ID` | Discord channel ID to post reminders to |
+| `WEATHER_CHAT_ID` | Telegram chat ID to post reminders to |
 | `WEATHER_REMINDER_HOURS` | Comma-separated hours in HKT to post (default: `8`).  E.g. `8,20` posts at 08:00 and 20:00 HKT. |
 
-Example:
-```
-WEATHER_CHANNEL_ID=1234567890123456789
-WEATHER_REMINDER_HOURS=8,20
-```
+To find your chat ID: forward a message to **[@userinfobot](https://t.me/userinfobot)** or use **[@RawDataBot](https://t.me/RawDataBot)**.
 
 ---
 
-## Automatic Code Review (new)
+## Automatic Code Review
 
 After `/build` or `/autorun` generates code, the bot automatically:
 
 1. **Format check** — verifies `### File:` blocks were produced; retries generation up to **3 times** if not
-2. **Code review** — a Code Reviewer AI checks for critical issues (syntax errors, missing imports, unimplemented placeholders, broken dependencies)
-3. **Auto-fix loop** — if issues are found, regenerates the code with the reviewer's feedback injected into the prompt (up to **2 review rounds**)
+2. **Code review** — a Code Reviewer AI checks for critical issues
+3. **Auto-fix loop** — if issues are found, regenerates the code with the reviewer's feedback injected (up to **2 review rounds**)
 4. **Upload to GitHub** — commits the verified code to `project/<slug>/` in the repository
-
----
-
-## How to Use the Bots
-
-### General Chat (mention or `/ask`)
-
-```
-@MyAIBot What is quantum computing?
-@MyAIBot @gemini-search What's in the news today?
-@MyAIBot @deepseek Write a haiku about autumn.
-/ask question:Explain async/await in Python model:openai-fast
-```
-
-### AI Company Discussion
-
-```
-/company task:Build a food delivery app
-/company task:Launch a campaign roles:CEO,Marketing Manager,Designer interactive:True
-```
-
-### Build & AutoRun
-
-```
-/build task:Create a REST API for a todo app in Python
-/build task:Build a React todo dashboard interactive:True
-/autorun
-/autorun stack:python
-```
-
-### Multiple Chained Follow-ups After a Build
-
-```
-/followup request:Add user authentication with JWT
-/followup request:Now add rate limiting to the auth routes
-/followup request:Can you write unit tests for the middleware?
-/followup request:Fix the import error in test_auth.py
-```
-
-### Weather
-
-```
-/weather
-```
 
 ---
 
@@ -265,53 +208,18 @@ After `/build` or `/autorun` generates code, the bot automatically:
 
 | Variable | Required | Description |
 |---|---|---|
-| `DISCORD_TOKEN` | ✅ | Discord bot token (unified bot + general-chat) |
-| `DISCORD_TOKEN_COMPANY` | legacy | Only needed when running `ai-company/bot.py` standalone |
+| `TELEGRAM_TOKEN` | ✅ | Telegram bot token from BotFather |
 | `POLLINATIONS_TOKEN` | ✅ | Pollinations AI API key |
 | `GITHUB_TOKEN` | optional | GitHub PAT — needed for `/build` to commit files |
 | `GITHUB_REPOSITORY` | optional | `owner/repo` — needed for `/build` to commit files |
-| `WEATHER_CHANNEL_ID` | optional | Discord channel ID for auto weather reminders |
+| `WEATHER_CHAT_ID` | optional | Telegram chat ID for auto weather reminders |
 | `WEATHER_REMINDER_HOURS` | optional | HKT hours for auto reminders (default: `8`). E.g. `8,20` |
-
----
-
-## Legacy Standalone Bots
-
-The individual bots still work independently if you prefer them:
-
-```bash
-# General Chat only
-pip install -r general-chat/requirements.txt
-export DISCORD_TOKEN="..."
-export POLLINATIONS_TOKEN="..."
-python general-chat/bot.py
-
-# AI Company only
-pip install -r ai-company/requirements.txt
-export DISCORD_TOKEN_COMPANY="..."
-export POLLINATIONS_TOKEN="..."
-python ai-company/bot.py
-```
-
-For the AI Company standalone setup, see **[`ai-company/SETUP.md`](ai-company/SETUP.md)**.
-
----
-
-## Interactive Mode (builds)
-
-Pass `interactive:True` to `/company` or `/build`. After each role responds, you see:
-
-- **▶ Continue** — let the discussion proceed
-- **✏️ Add My Input** — type your perspective (up to 1 000 chars); it becomes **Stakeholder Input** that all subsequent roles can see and react to
-
-`/autorun` always runs interactive with a 90-second auto-continue timer.
 
 ---
 
 ## Notes
 
-- Sessions are stored **in memory** — restart the bot and sessions reset. Use Railway or a VPS for persistent uptime.
+- Sessions are stored **in memory** — restart the bot and sessions reset.  Use Railway or a VPS for persistent uptime.
 - If all AI models fail: *"Sorry, all AI models are currently unavailable."*
-- Responses exceeding Discord's 2 000-character limit are automatically split into multiple messages.
-- Code fences (```` ``` ````) are properly opened/closed across splits to preserve Discord's syntax highlighting.
-- Build-session `/followup` calls are **serialised per channel** — if you fire two `/followup` commands in rapid succession, the second waits for the first to finish to avoid race conditions.
+- Responses exceeding Telegram's 4 096-character limit are automatically split into multiple messages.
+- Build-session `/followup` calls are **serialised per chat** — if you fire two `/followup` commands rapidly, the second waits for the first to finish.
