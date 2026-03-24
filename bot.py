@@ -69,6 +69,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -627,6 +628,8 @@ _AUTO_STACKS: dict[str, str] = {
     "php": "PHP + HTML (a dynamic web page or small PHP web API)",
     "actions": "GitHub Actions (a YAML workflow for CI/CD or automation)",
 }
+
+_STACK_EMOJI: dict[str, str] = {"python": "🐍", "php": "🐘", "actions": "⚙️"}
 
 
 async def generate_auto_task(
@@ -1343,7 +1346,7 @@ async def _wait_for_user_choice(
 
 
 async def _on_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle plain text messages — only responds in private chats or when mentioned."""
+    """Handle plain text and photo messages — only responds in private chats or when mentioned."""
     msg = update.effective_message
     if msg is None:
         return
@@ -1360,9 +1363,14 @@ async def _on_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Strip the mention
         content = (msg.text or "").replace(f"@{bot_username}", "").strip()
     else:
-        content = (msg.text or "").strip()
+        content = (msg.text or msg.caption or "").strip()
 
-    if not content:
+    # Collect image file IDs if photos are attached
+    image_file_ids = get_image_urls_from_tg(msg)
+    if image_file_ids:
+        if not content:
+            content = "Describe this image."
+    elif not content:
         await msg.reply_text(
             "Please send me a message to chat!\nUse /ask for a command interface, or /about for help."
         )
@@ -1371,6 +1379,12 @@ async def _on_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = chat.id
     history = conversation_history.get(chat_id, [])
     preferred = user_preferred_models.get(user.id)
+
+    # Note: Telegram file IDs are not direct URLs; vision support requires
+    # downloading the file first. For now we pass the content text only.
+    # Image-aware responses will note the image was received.
+    if image_file_ids and not content.startswith("Describe"):
+        content = f"[Image attached] {content}"
 
     task = asyncio.create_task(
         _stream_to_message(content, chat_id, context.bot, preferred, history, msg.message_id)
@@ -2001,19 +2015,24 @@ async def interactive_callback_handler(update: Update, context: ContextTypes.DEF
 
 
 async def interactive_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Capture text input typed by user during interactive sessions."""
+    """Capture text input typed by user during interactive sessions.
+
+    Runs in handler group 0 (higher priority).  Raises ApplicationHandlerStop
+    when it consumes the message so the general chat handler in group 1 is skipped.
+    """
     msg = update.effective_message
     if msg is None:
         return
     key = context.chat_data.get("awaiting_interactive_input")  # type: ignore[union-attr]
     if not key:
-        return
+        return  # not waiting for input — let group 1 handle it normally
     del context.chat_data["awaiting_interactive_input"]  # type: ignore[union-attr]
 
     fut = _interactive_futures.get(key)
     if fut and not fut.done():
         fut.set_result(msg.text or "")
         await msg.reply_text(f"✅ _Your input noted: \"{(msg.text or '')[:80]}\"_", parse_mode=ParseMode.MARKDOWN)
+    raise ApplicationHandlerStop  # prevent the general chat handler from also firing
 
 
 # ---------------------------------------------------------------------------
@@ -2216,17 +2235,22 @@ def _build_application() -> Application:
     # Callback queries for interactive mode
     app.add_handler(CallbackQueryHandler(interactive_callback_handler, pattern=r"^interactive_"))
 
-    # Plain message handler — for general chat (DMs and group @mentions)
-    # Must come AFTER the interactive_text_handler so awaiting input is caught first
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        interactive_text_handler,
-        block=False,
-    ))
-    app.add_handler(MessageHandler(
-        (filters.TEXT | filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND,
-        _on_message_handler,
-    ))
+    # Interactive input capture (group 0 — higher priority).
+    # Raises ApplicationHandlerStop when it consumes the message, preventing
+    # the general chat handler in group 1 from also firing.
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, interactive_text_handler),
+        group=0,
+    )
+
+    # General chat — DMs and group @mentions (group 1).
+    app.add_handler(
+        MessageHandler(
+            (filters.TEXT | filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND,
+            _on_message_handler,
+        ),
+        group=1,
+    )
 
     # Weather reminder job (every 30 minutes)
     if WEATHER_CHAT_ID and WEATHER_REMINDER_HOURS:
