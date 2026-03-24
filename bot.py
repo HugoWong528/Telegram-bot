@@ -1,14 +1,14 @@
-"""Unified AI Discord Bot.
+"""Unified AI Telegram Bot.
 
-Combines the General Chat bot (streaming AI replies, conversation history,
-vision models) and the AI Company bot (multi-role company discussions,
-/build, /autorun, code review) into a single process that requires only
-**one Discord bot token** (``DISCORD_TOKEN``).
+Combines general AI chat (streaming replies, conversation history, vision
+models) and the AI Company bot (multi-role company discussions, /build,
+/autorun, code review) into a single process that requires only one
+``TELEGRAM_TOKEN``.
 
-Slash commands
---------------
+Commands
+--------
 General chat
-    /ask      — ask the AI a question (streaming, model selection)
+    /ask      — ask the AI a question (streaming live updates)
     /cancel   — cancel your current in-progress request
     /models   — list available AI models
     /settings — view / set your preferred AI model
@@ -23,7 +23,7 @@ Weather
     /weather   — current Hong Kong weather + AI clothing suggestions
 
 Universal
-    /followup  — universal context-aware continuation:
+    /followup  — context-aware continuation:
                  • cancels an active stream and redirects (if one is running)
                  • build-session follow-up (if a /build or /autorun session exists)
                    supports unlimited chained follow-ups
@@ -33,8 +33,7 @@ Universal
 Environment variables
 ---------------------
 Required
-    DISCORD_TOKEN          Bot token (also accepted as DISCORD_TOKEN_COMPANY
-                           for backwards-compatibility with the old layout)
+    TELEGRAM_TOKEN         Telegram bot token from BotFather
     POLLINATIONS_TOKEN     Pollinations AI API key
 
 Optional (needed for /build GitHub commit)
@@ -42,7 +41,7 @@ Optional (needed for /build GitHub commit)
     GITHUB_REPOSITORY      Repo in "owner/repo" format
 
 Optional (Hong Kong weather auto-reminders)
-    WEATHER_CHANNEL_ID     Discord channel ID to post auto weather reminders
+    WEATHER_CHAT_ID        Telegram chat ID to post auto weather reminders
     WEATHER_REMINDER_HOURS Comma-separated HKT hours to send reminders (default: 8)
                            Example: "8,20" sends at 08:00 and 20:00 HKT
 """
@@ -59,9 +58,24 @@ import xml.etree.ElementTree as ET
 from typing import AsyncGenerator, Callable, Optional
 
 import aiohttp
-import discord
-from discord import app_commands
-from discord.ext import commands, tasks
+from telegram import (
+    Bot,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    Update,
+)
+from telegram.constants import ParseMode
+from telegram.error import BadRequest, TelegramError
+from telegram.ext import (
+    Application,
+    ApplicationHandlerStop,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from zoneinfo import ZoneInfo
 
 _HKT = ZoneInfo("Asia/Hong_Kong")
@@ -80,11 +94,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Accept DISCORD_TOKEN *or* the legacy DISCORD_TOKEN_COMPANY env var.
-DISCORD_TOKEN: str = (
-    os.environ.get("DISCORD_TOKEN")
-    or os.environ.get("DISCORD_TOKEN_COMPANY", "")
-)
+TELEGRAM_TOKEN: str = os.environ.get("TELEGRAM_TOKEN", "")
 POLLINATIONS_TOKEN: str = os.environ.get("POLLINATIONS_TOKEN", "")
 
 # GitHub integration (optional — only needed for /build file commits)
@@ -94,9 +104,9 @@ GITHUB_API_BASE = "https://api.github.com"
 PROJECT_FOLDER = "project"
 
 # Hong Kong weather auto-reminders (optional)
-# WEATHER_CHANNEL_ID  — Discord channel ID to post auto reminders
+# WEATHER_CHAT_ID  — Telegram chat ID to post auto reminders
 # WEATHER_REMINDER_HOURS — comma-separated HKT hours, e.g. "8,20"
-WEATHER_CHANNEL_ID: int = int(os.environ.get("WEATHER_CHANNEL_ID", "0") or "0")
+WEATHER_CHAT_ID: int = int(os.environ.get("WEATHER_CHAT_ID", "0") or "0")
 _raw_hours = os.environ.get("WEATHER_REMINDER_HOURS", "8")
 WEATHER_REMINDER_HOURS: list[int] = [
     int(h.strip()) for h in _raw_hours.split(",") if h.strip().isdigit()
@@ -117,10 +127,10 @@ MODEL_CHAIN = [
     "qwen-safety",
 ]
 
-DISCORD_MAX_LENGTH = 2000
-STREAM_EDIT_INTERVAL = 1.5   # seconds between live edit updates
-STREAM_DISPLAY_LIMIT = 1950  # chars shown in a streaming placeholder
-MAX_HISTORY = 20             # max conversation messages per channel
+TELEGRAM_MAX_LENGTH = 4096
+STREAM_EDIT_INTERVAL = 2.0   # seconds between live edit updates
+STREAM_DISPLAY_LIMIT = 4000  # chars shown in a streaming placeholder
+MAX_HISTORY = 20             # max conversation messages per chat
 
 # Weather parsing constants
 _HKO_TEMP_RE = re.compile(r"氣溫\s*[：:]\s*(\d+(?:\.\d+)?)")
@@ -159,14 +169,6 @@ MODEL_INFO: dict[str, tuple[str, bool]] = {
     "deepseek": ("DeepSeek model", False),
     "qwen-safety": ("Qwen safety-focused model", False),
 }
-
-MODEL_CHOICES: list[app_commands.Choice[str]] = [
-    app_commands.Choice(
-        name=f"{model}{' [vision]' if MODEL_INFO.get(model, ('', False))[1] else ''}",
-        value=model,
-    )
-    for model in sorted(MODEL_INFO)
-][:25]
 
 # ---------------------------------------------------------------------------
 # AI Company role configuration
@@ -263,24 +265,22 @@ ROLE_PROMPTS: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
-# Bot setup
+# Bot application (set up after handlers are defined)
 # ---------------------------------------------------------------------------
 
-intents = discord.Intents.default()
-intents.message_content = True  # needed for on_message mention handling
-
-bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
+# Built at the bottom of this file via _build_application()
+_app: Optional[Application] = None
 
 # ---------------------------------------------------------------------------
 # In-memory state
 # ---------------------------------------------------------------------------
 
-# Per-channel build sessions for /followup continuations.
-# Structure: { channel_id: { task, discussion, final_outcome, code_files, ... } }
+# Per-chat build sessions for /followup continuations.
+# Structure: { chat_id: { task, discussion, final_outcome, code_files, ... } }
 build_sessions: dict[int, dict] = {}
 
-# Per-channel conversation history for general chat.
-# Structure: { channel_id: [ {"role": ..., "content": ...}, ... ] }
+# Per-chat conversation history for general chat.
+# Structure: { chat_id: [ {"role": ..., "content": ...}, ... ] }
 conversation_history: dict[int, list[dict]] = {}
 
 # Per-user preferred model (set via /settings).
@@ -289,9 +289,13 @@ user_preferred_models: dict[int, str] = {}
 # Per-user active streaming tasks (used by /cancel and /followup interrupt mode).
 active_requests: dict[int, asyncio.Task] = {}
 
-# Per-channel asyncio locks for build-session follow-ups.
+# Per-chat asyncio locks for build-session follow-ups.
 # Prevents two concurrent /followup invocations from racing on the same session.
 followup_locks: dict[int, asyncio.Lock] = {}
+
+# Pending interactive callbacks: maps a unique key → asyncio.Future
+# Used to pass user replies (text or button presses) back to running handlers.
+_interactive_futures: dict[str, "asyncio.Future[Optional[str]]"] = {}
 
 # Tracks (date_ordinal, hour) tuples for which a weather reminder was already sent.
 _weather_sent_hours: set[tuple[int, int]] = set()
@@ -321,11 +325,11 @@ def _open_fence(text: str) -> str | None:
     return open_token
 
 
-def split_message(text: str, limit: int = DISCORD_MAX_LENGTH) -> list[str]:
+def split_message(text: str, limit: int = TELEGRAM_MAX_LENGTH) -> list[str]:
     """Split *text* into chunks ≤ *limit* characters.
 
     Prefers splitting on newlines, then spaces.  Closes and re-opens Markdown
-    code fences across splits so Discord formatting stays intact.
+    code fences across splits so formatting stays intact.
     """
     if len(text) <= limit:
         return [text]
@@ -417,19 +421,24 @@ def _fallback_footer(
     return ""
 
 
-def get_image_urls(message: discord.Message) -> list[str]:
-    return [
-        a.url for a in message.attachments
-        if a.content_type and a.content_type.startswith("image/")
-    ]
+def get_image_urls_from_tg(message: Message) -> list[str]:
+    """Return image file IDs from a Telegram message (photos or image documents)."""
+    urls: list[str] = []
+    if message.photo:
+        # message.photo is a list of PhotoSize (smallest → largest); take the largest
+        largest = message.photo[-1]
+        urls.append(f"tg://{largest.file_id}")
+    if message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
+        urls.append(f"tg://{message.document.file_id}")
+    return urls
 
 
-def _update_history(channel_id: int, user_text: str, assistant_reply: str) -> None:
-    history = conversation_history.setdefault(channel_id, [])
+def _update_history(chat_id: int, user_text: str, assistant_reply: str) -> None:
+    history = conversation_history.setdefault(chat_id, [])
     history.append({"role": "user", "content": user_text})
     history.append({"role": "assistant", "content": assistant_reply})
     if len(history) > MAX_HISTORY:
-        conversation_history[channel_id] = history[-MAX_HISTORY:]
+        conversation_history[chat_id] = history[-MAX_HISTORY:]
 
 
 async def _single_model_call(
@@ -619,6 +628,8 @@ _AUTO_STACKS: dict[str, str] = {
     "php": "PHP + HTML (a dynamic web page or small PHP web API)",
     "actions": "GitHub Actions (a YAML workflow for CI/CD or automation)",
 }
+
+_STACK_EMOJI: dict[str, str] = {"python": "🐍", "php": "🐘", "actions": "⚙️"}
 
 
 async def generate_auto_task(
@@ -1082,8 +1093,8 @@ async def get_weather_clothing_suggestion(weather: dict) -> str:
             return _clothing_fallback(weather.get("temperature"), weather.get("humidity"))
 
 
-def _build_weather_message(weather: dict, suggestion: str, *, header: str = "🌤️ **Hong Kong Current Weather**") -> str:
-    """Format weather data and clothing suggestion into a Discord message."""
+def _build_weather_message(weather: dict, suggestion: str, *, header: str = "🌤️ *Hong Kong Current Weather*") -> str:
+    """Format weather data and clothing suggestion into a Telegram message."""
     temp_str = f"{weather['temperature']}°C" if weather.get("temperature") else "N/A"
     humid_str = f"{weather['humidity']}%" if weather.get("humidity") else "N/A"
 
@@ -1091,15 +1102,15 @@ def _build_weather_message(weather: dict, suggestion: str, *, header: str = "�
         header,
         f"📅 {weather['title']}",
         "",
-        f"🌡️ 氣溫 / Temperature: **{temp_str}**",
-        f"💧 相對濕度 / Humidity: **{humid_str}**",
+        f"🌡️ 氣溫 / Temperature: *{temp_str}*",
+        f"💧 相對濕度 / Humidity: *{humid_str}*",
     ]
     if weather.get("summary"):
         lines.append(f"🌈 天氣 / Condition: {weather['summary']}")
     lines += [
         "",
         "---",
-        "👕 **今日穿著建議 / Clothing Suggestion:**",
+        "👕 *今日穿著建議 / Clothing Suggestion:*",
         suggestion,
     ]
     return "\n".join(lines)
@@ -1213,386 +1224,336 @@ async def commit_project(
 
 
 # ---------------------------------------------------------------------------
-# Thread helper
+# Telegram helpers
 # ---------------------------------------------------------------------------
 
 
-async def _create_task_thread(
-    msg: discord.WebhookMessage,
-    name: str,
-    channel: discord.TextChannel | None = None,
-) -> discord.Thread | None:
+async def _safe_edit_text(msg: Message, text: str) -> None:
+    """Edit a Telegram message, ignoring 'message is not modified' errors."""
     try:
-        if channel is not None:
-            full_msg = await channel.fetch_message(msg.id)
-            return await full_msg.create_thread(name=name[:100])
-        return await msg.create_thread(name=name[:100])
-    except (discord.Forbidden, discord.HTTPException, AttributeError, ValueError) as exc:
-        logger.warning("Could not create thread: %s", exc)
-        return None
+        await msg.edit_text(text)
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            logger.debug("edit_text failed: %s", exc)
+    except TelegramError as exc:
+        logger.debug("edit_text failed: %s", exc)
 
 
-# ---------------------------------------------------------------------------
-# Discord UI components
-# ---------------------------------------------------------------------------
+async def _send_chunks(
+    chat_id: int,
+    text: str,
+    bot: Bot,
+    reply_to: int | None = None,
+) -> None:
+    """Send *text* split into chunks ≤ TELEGRAM_MAX_LENGTH."""
+    chunks = split_message(text)
+    for i, chunk in enumerate(chunks):
+        if i == 0 and reply_to:
+            await bot.send_message(chat_id=chat_id, text=chunk, reply_to_message_id=reply_to)
+        else:
+            await bot.send_message(chat_id=chat_id, text=chunk)
 
 
-class UserInputModal(discord.ui.Modal, title="Add Your Perspective"):
-    perspective = discord.ui.TextInput(
-        label="Your input / perspective",
-        style=discord.TextStyle.paragraph,
-        placeholder="Share your thoughts, redirect the discussion, add constraints…",
-        required=True,
-        max_length=1000,
+async def _stream_to_message(
+    user_message: str,
+    chat_id: int,
+    bot: Bot,
+    preferred_model: str | None,
+    history: list[dict] | None,
+    reply_to_id: int | None,
+) -> tuple[str, str | None, bool]:
+    """Stream an AI reply, editing a placeholder message live.
+
+    Returns (reply_text, model_used, is_fallback).
+    """
+    # Send placeholder
+    placeholder_msg = await bot.send_message(
+        chat_id=chat_id,
+        text="▌",
+        reply_to_message_id=reply_to_id,
     )
 
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer()
+    accumulated = ""
+    last_edit = 0.0
+
+    async def _progress(text: str) -> None:
+        nonlocal last_edit
+        now = asyncio.get_running_loop().time()
+        if now - last_edit >= STREAM_EDIT_INTERVAL:
+            display = text[-STREAM_DISPLAY_LIMIT:] + "▌" if len(text) > STREAM_DISPLAY_LIMIT else text + "▌"
+            await _safe_edit_text(placeholder_msg, display)
+            last_edit = now
+
+    reply, model_used, is_fallback = await get_ai_reply_streaming(
+        user_message, preferred_model, history=history, progress_cb=_progress
+    )
+
+    # Final update — split if needed
+    display = reply + _fallback_footer(model_used, preferred_model, is_fallback)
+    chunks = split_message(display)
+    await _safe_edit_text(placeholder_msg, chunks[0])
+    for chunk in chunks[1:]:
+        await bot.send_message(chat_id=chat_id, text=chunk)
+
+    return reply, model_used, is_fallback
 
 
-class InterruptView(discord.ui.View):
-    def __init__(self) -> None:
-        super().__init__(timeout=90)
-        self.action: str = "continue"
-        self.user_input: Optional[str] = None
-        self._message: Optional[discord.Message] = None
-
-    @discord.ui.button(label="▶ Continue", style=discord.ButtonStyle.green)
-    async def continue_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        self.action = "continue"
-        logger.info("InterruptView: user %s chose Continue", interaction.user)
-        for item in self.children:
-            item.disabled = True  # type: ignore[union-attr]
-        await interaction.response.edit_message(view=self)
-        self.stop()
-
-    @discord.ui.button(label="✏️ Add My Input", style=discord.ButtonStyle.blurple)
-    async def input_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        logger.info("InterruptView: user %s opening input modal", interaction.user)
-        modal = UserInputModal()
-        await interaction.response.send_modal(modal)
-        await modal.wait()
-        self.user_input = modal.perspective.value
-        self.action = "input"
-        logger.info("InterruptView: user %s submitted input (%d chars)", interaction.user, len(self.user_input or ""))
-        for item in self.children:
-            item.disabled = True  # type: ignore[union-attr]
-        # Attempt to update the message to show disabled buttons after modal submission.
-        if self._message is not None:
-            try:
-                await self._message.edit(view=self)
-            except discord.HTTPException as exc:
-                logger.warning("InterruptView: could not update message after input: %s", exc)
-        self.stop()
-
-    async def on_timeout(self) -> None:
-        logger.info("InterruptView: timed out, auto-continuing")
-        self.action = "continue"
-        for item in self.children:
-            item.disabled = True  # type: ignore[union-attr]
-        if self._message is not None:
-            try:
-                await self._message.edit(view=self)
-            except discord.HTTPException as exc:
-                logger.warning("InterruptView: could not update message on timeout: %s", exc)
-        self.stop()
+# ---------------------------------------------------------------------------
+# Interactive helper: wait for user to press a button or type an input
+# ---------------------------------------------------------------------------
 
 
-class RoleSelectView(discord.ui.View):
-    def __init__(self, defaults: list[str]) -> None:
-        super().__init__(timeout=120)
-        self.selected_roles: list[str] = list(defaults)
-        options = [
-            discord.SelectOption(label=role, value=role, default=role in defaults)
-            for role in ROLE_PROMPTS
+async def _wait_for_user_choice(
+    chat_id: int,
+    bot: Bot,
+    next_role: str,
+) -> Optional[str]:
+    """Send Continue / Add Input buttons and wait for user selection.
+
+    Returns the user's typed input string, or None for "continue".
+    """
+    key = f"interactive:{chat_id}"
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[Optional[str]] = loop.create_future()
+    _interactive_futures[key] = fut
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("▶ Continue", callback_data=f"interactive_continue:{chat_id}"),
+            InlineKeyboardButton("✏️ Add My Input", callback_data=f"interactive_input:{chat_id}"),
         ]
-        visible = options[:25]
-        if len(options) > 25:
-            logger.warning("ROLE_PROMPTS has %d roles; only first 25 shown.", len(options))
-        select = discord.ui.Select(
-            placeholder="Choose roles for this build (select any number)…",
-            min_values=1,
-            max_values=len(visible),
-            options=visible,
-        )
-        select.callback = self._on_select  # type: ignore[method-assign]
-        self.add_item(select)
+    ])
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"*Next up: {next_role}.*  Would you like to add your perspective first?",
+        reply_markup=keyboard,
+    )
 
-    async def _on_select(self, interaction: discord.Interaction) -> None:
-        self.selected_roles = interaction.data["values"]  # type: ignore[index]
-        await interaction.response.defer()
-        self.stop()
-
-    async def on_timeout(self) -> None:
-        self.stop()
-
-
-# ---------------------------------------------------------------------------
-# Bot events
-# ---------------------------------------------------------------------------
-
-
-@bot.event
-async def on_ready():
-    await bot.tree.sync()
-    logger.info("Unified AI Bot logged in as %s (ID: %s)", bot.user, bot.user.id)
-    logger.info("General chat active — mention @%s, send a DM, or reply in a bot thread to chat.", bot.user.name)
-    if WEATHER_CHANNEL_ID and WEATHER_REMINDER_HOURS:
-        if not weather_reminder_task.is_running():
-            weather_reminder_task.start()
-        logger.info(
-            "Weather reminders enabled: channel=%s hours=%s HKT",
-            WEATHER_CHANNEL_ID, WEATHER_REMINDER_HOURS,
-        )
-    else:
-        logger.info("Weather reminders disabled (WEATHER_CHANNEL_ID not set).")
-
-
-@bot.tree.error
-async def on_app_command_error(
-    interaction: discord.Interaction,
-    error: app_commands.AppCommandError,
-) -> None:
-    logger.error("Unhandled slash-command error: %s", error, exc_info=True)
-    msg = f"⚠️ An unexpected error occurred: {error}"
     try:
-        if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True)
-        else:
-            await interaction.response.send_message(msg, ephemeral=True)
-    except Exception as send_exc:
-        logger.warning("Could not send error message: %s", send_exc)
+        result = await asyncio.wait_for(fut, timeout=90)
+    except asyncio.TimeoutError:
+        result = None
+        logger.info("Interactive wait timed out for chat %s — auto-continuing", chat_id)
+    finally:
+        _interactive_futures.pop(key, None)
+
+    return result
 
 
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author == bot.user:
+# ---------------------------------------------------------------------------
+# Bot event handlers
+# ---------------------------------------------------------------------------
+
+
+async def _on_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle plain text and photo messages — only responds in private chats or when mentioned."""
+    msg = update.effective_message
+    if msg is None:
+        return
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat is None or user is None:
         return
 
-    # Respond when the bot is mentioned, in a DM, OR continuing an existing
-    # conversation thread (the user doesn't need to re-mention the bot for
-    # every follow-up in a thread the bot already replied to).
-    in_conversation_thread = (
-        isinstance(message.channel, discord.Thread)
-        and message.channel.id in conversation_history
-    )
-    mentioned = bot.user.mentioned_in(message)
-
-    if mentioned or isinstance(message.channel, discord.DMChannel) or in_conversation_thread:
-        logger.info(
-            "General chat message from %s (channel %s, thread=%s, mentioned=%s)",
-            message.author, message.channel.id, in_conversation_thread, mentioned,
-        )
-        content = message.content
-        for mention in message.mentions:
-            content = content.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
-        content = content.strip()
-
-        token, content = parse_model_prefix(content)
-
-        if token == "about":
-            await message.reply(_build_about_message())
+    # In groups: only respond when the bot is mentioned
+    if chat.type != "private":
+        bot_username = (await context.bot.get_me()).username
+        if msg.text and f"@{bot_username}" not in (msg.text or ""):
             return
+        # Strip the mention
+        content = (msg.text or "").replace(f"@{bot_username}", "").strip()
+    else:
+        content = (msg.text or msg.caption or "").strip()
 
-        preferred_model: str | None = token if token is not None else user_preferred_models.get(message.author.id)
-        image_urls = get_image_urls(message)
-
-        if image_urls and preferred_model and preferred_model not in VISION_MODELS:
-            await message.reply(
-                f"⚠️ **{preferred_model}** doesn't support image input. "
-                "Switching to a vision-capable model automatically."
-            )
-            preferred_model = None
-
-        if not content and not image_urls:
-            await message.reply(
-                "Please send a message (or attach an image) for me to reply to!\n"
-                "Use `/ask` for a slash-command interface, or `/about` for help."
-            )
-            return
-
+    # Collect image file IDs if photos are attached
+    image_file_ids = get_image_urls_from_tg(msg)
+    if image_file_ids:
         if not content:
             content = "Describe this image."
-
-        reply_channel: discord.abc.Messageable = message.channel
-        if isinstance(message.channel, discord.TextChannel):
-            try:
-                thread_name = f"AI Chat — {message.author.display_name}"[:100]
-                reply_channel = await message.create_thread(name=thread_name, auto_archive_duration=60)
-            except discord.HTTPException as exc:
-                logger.warning("Could not create thread: %s", exc)
-
-        history_key = reply_channel.id
-        history = conversation_history.get(history_key, [])
-
-        if isinstance(reply_channel, discord.Thread):
-            placeholder_msg = await reply_channel.send("▌")
-        else:
-            placeholder_msg = await message.reply("▌")
-
-        async def _on_progress(text: str) -> None:
-            display = text[-STREAM_DISPLAY_LIMIT:] + "▌" if len(text) > STREAM_DISPLAY_LIMIT else text + "▌"
-            try:
-                await placeholder_msg.edit(content=display)
-            except discord.HTTPException:
-                pass
-
-        task = asyncio.create_task(
-            get_ai_reply_streaming(content, preferred_model, image_urls, history, _on_progress)
+    elif not content:
+        await msg.reply_text(
+            "Please send me a message to chat!\nUse /ask for a command interface, or /about for help."
         )
-        active_requests[message.author.id] = task
-        try:
-            reply, model_used, is_fallback = await task
-        except asyncio.CancelledError:
-            await placeholder_msg.edit(content="⛔ Your in-progress request has been cancelled.")
-            return
-        finally:
-            active_requests.pop(message.author.id, None)
+        return
 
-        display_reply = reply + _fallback_footer(model_used, preferred_model, is_fallback)
-        if model_used:
-            _update_history(history_key, content, reply)
+    chat_id = chat.id
+    history = conversation_history.get(chat_id, [])
+    preferred = user_preferred_models.get(user.id)
 
-        chunks = split_message(display_reply)
-        await placeholder_msg.edit(content=chunks[0])
-        for chunk in chunks[1:]:
-            await reply_channel.send(chunk)
+    # Note: Telegram file IDs are not direct URLs; vision support requires
+    # downloading the file first. For now we pass the content text only.
+    # Image-aware responses will note the image was received.
+    if image_file_ids and not content.startswith("Describe"):
+        content = f"[Image attached] {content}"
 
-    await bot.process_commands(message)
-
-
-# ---------------------------------------------------------------------------
-# General chat slash commands
-# ---------------------------------------------------------------------------
-
-
-@bot.tree.command(name="ask", description="Ask the AI a question with optional model selection")
-@app_commands.describe(
-    question="Your question or prompt for the AI",
-    model="AI model to use (leave blank for automatic selection)",
-)
-@app_commands.choices(model=MODEL_CHOICES)
-async def ask_slash(interaction: discord.Interaction, question: str, model: str | None = None):
-    preferred_model = model or None
-    await interaction.response.defer(thinking=True)
-
-    history_key = interaction.channel_id if interaction.channel_id is not None else interaction.user.id
-    history = conversation_history.get(history_key, [])
-
-    placeholder_msg = await interaction.followup.send("▌")
-
-    async def _on_progress(text: str) -> None:
-        display = text[-STREAM_DISPLAY_LIMIT:] + "▌" if len(text) > STREAM_DISPLAY_LIMIT else text + "▌"
-        try:
-            await placeholder_msg.edit(content=display)
-        except discord.HTTPException:
-            pass
-
-    t = asyncio.create_task(
-        get_ai_reply_streaming(question, preferred_model, history=history, progress_cb=_on_progress)
+    task = asyncio.create_task(
+        _stream_to_message(content, chat_id, context.bot, preferred, history, msg.message_id)
     )
-    active_requests[interaction.user.id] = t
+    active_requests[user.id] = task
     try:
-        reply, model_used, is_fallback = await t
+        reply, model_used, _ = await task
     except asyncio.CancelledError:
-        await placeholder_msg.edit(content="⛔ Your in-progress request has been cancelled.")
+        await context.bot.send_message(chat_id=chat_id, text="⛔ Your in-progress request has been cancelled.")
         return
     finally:
-        active_requests.pop(interaction.user.id, None)
+        active_requests.pop(user.id, None)
 
     if model_used:
-        _update_history(history_key, question, reply)
-
-    display_reply = reply + _fallback_footer(model_used, preferred_model, is_fallback)
-    chunks = split_message(display_reply)
-    await placeholder_msg.edit(content=chunks[0])
-    for chunk in chunks[1:]:
-        await interaction.followup.send(chunk)
+        _update_history(chat_id, content, reply)
 
 
-@bot.tree.command(name="cancel", description="Hard-cancel your current in-progress AI request")
-async def cancel_slash(interaction: discord.Interaction):
-    task = active_requests.pop(interaction.user.id, None)
+# ---------------------------------------------------------------------------
+# General chat commands
+# ---------------------------------------------------------------------------
+
+
+async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/ask <question> [model:<model>]"""
+    msg = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if msg is None or user is None or chat is None:
+        return
+
+    # Parse: /ask <question>  or  /ask model:<model> <question>
+    args = context.args or []
+    text = " ".join(args).strip()
+    if not text:
+        await msg.reply_text("Usage: /ask <your question>\nOptionally prefix with model:<model_name>")
+        return
+
+    preferred_model: str | None = None
+    if text.lower().startswith("model:"):
+        parts = text.split(None, 1)
+        model_part = parts[0][6:]
+        if model_part in ALL_MODELS:
+            preferred_model = model_part
+            text = parts[1].strip() if len(parts) > 1 else ""
+        if not text:
+            await msg.reply_text("Please provide a question after model:<name>")
+            return
+
+    chat_id = chat.id
+    history = conversation_history.get(chat_id, [])
+    if preferred_model is None:
+        preferred_model = user_preferred_models.get(user.id)
+
+    task = asyncio.create_task(
+        _stream_to_message(text, chat_id, context.bot, preferred_model, history, msg.message_id)
+    )
+    active_requests[user.id] = task
+    try:
+        reply, model_used, _ = await task
+    except asyncio.CancelledError:
+        await context.bot.send_message(chat_id=chat_id, text="⛔ Your in-progress request has been cancelled.")
+        return
+    finally:
+        active_requests.pop(user.id, None)
+
+    if model_used:
+        _update_history(chat_id, text, reply)
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cancel — cancel an in-progress AI request."""
+    msg = update.effective_message
+    user = update.effective_user
+    if msg is None or user is None:
+        return
+    task = active_requests.pop(user.id, None)
     if task and not task.done():
         task.cancel()
-        await interaction.response.send_message("⛔ Your in-progress request has been cancelled.")
+        await msg.reply_text("⛔ Your in-progress request has been cancelled.")
     else:
-        await interaction.response.send_message("You don't have an active request to cancel.")
+        await msg.reply_text("You don't have an active request to cancel.")
 
 
-@bot.tree.command(name="models", description="List all available AI models with their capabilities")
-async def models_slash(interaction: discord.Interaction):
-    lines = ["**📋 Available AI Models**", ""]
+async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/models — list available AI models."""
+    msg = update.effective_message
+    if msg is None:
+        return
+    lines = ["📋 *Available AI Models*", ""]
     for model in sorted(MODEL_INFO):
         desc, vision = MODEL_INFO[model]
         vision_mark = "✅" if vision else "❌"
-        lines.append(f"**`{model}`** {vision_mark} — {desc}")
-    lines += ["", "*Tip: Use `/ask` and pick a model from the dropdown.*"]
-    await interaction.response.send_message("\n".join(lines))
+        lines.append(f"• `{model}` {vision_mark} — {desc}")
+    lines += ["", "_Tip: Use /ask model:<name> <question> to pick a model._"]
+    await msg.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
-@bot.tree.command(name="settings", description="View or set your preferred AI model")
-@app_commands.describe(model="Your preferred AI model (leave blank to view current setting)")
-@app_commands.choices(model=MODEL_CHOICES)
-async def settings_slash(interaction: discord.Interaction, model: str | None = None):
-    if model is None:
-        current = user_preferred_models.get(interaction.user.id)
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/settings [model:<model>] — view or set preferred AI model."""
+    msg = update.effective_message
+    user = update.effective_user
+    if msg is None or user is None:
+        return
+    args = context.args or []
+    if not args:
+        current = user_preferred_models.get(user.id)
         if current:
             desc, vision = MODEL_INFO.get(current, ("Unknown model", False))
-            vision_tag = " [vision]" if vision else ""
-            await interaction.response.send_message(
-                f"Your preferred model is **{current}**{vision_tag} — {desc}.\n"
-                "Use `/settings model:...` to change it."
+            vtag = " [vision]" if vision else ""
+            await msg.reply_text(
+                f"Your preferred model is *{current}*{vtag} — {desc}.\n"
+                "Use `/settings <model_name>` to change it.",
+                parse_mode=ParseMode.MARKDOWN,
             )
         else:
-            await interaction.response.send_message(
+            await msg.reply_text(
                 "No preferred model set — using automatic model selection.\n"
-                "Use `/settings model:...` to set one."
+                "Use `/settings <model_name>` to set one."
             )
-    else:
-        user_preferred_models[interaction.user.id] = model
-        desc, vision = MODEL_INFO.get(model, ("Unknown model", False))
-        vision_tag = " [vision]" if vision else ""
-        await interaction.response.send_message(
-            f"✅ Preferred model set to **{model}**{vision_tag} — {desc}."
-        )
+        return
 
+    model = args[0].strip()
+    if model not in ALL_MODELS:
+        model_list = ", ".join(sorted(ALL_MODELS))
+        await msg.reply_text(f"Unknown model `{model}`.\nAvailable: {model_list}", parse_mode=ParseMode.MARKDOWN)
+        return
 
-# ---------------------------------------------------------------------------
-# AI Company slash commands
-# ---------------------------------------------------------------------------
-
-
-@bot.tree.command(name="company", description="Run an AI company discussion on a task")
-@app_commands.describe(
-    task="The task or project for the company to discuss",
-    roles="Comma-separated roles (e.g. 'CEO,CTO,Designer'). Leave blank for defaults.",
-    interactive="Pause after each role so you can add your own perspective. Default: False.",
-)
-async def company_slash(
-    interaction: discord.Interaction,
-    task: str,
-    roles: str | None = None,
-    interactive: bool = False,
-):
-    await interaction.response.defer(thinking=True)
-
-    role_list = [r.strip() for r in roles.split(",") if r.strip()] if roles else list(DEFAULT_ROLES)
-
-    logger.info("Company discussion | task=%r | roles=%s | interactive=%s", task, role_list, interactive)
-
-    roles_display = ", ".join(role_list)
-    mode_note = " *(interactive)*" if interactive else ""
-    header = (
-        f"🏢 **AI Company Discussion**{mode_note}\n"
-        f"📋 **Task:** {task}\n"
-        f"👥 **Participants:** {roles_display}\n"
-        f"📡 *Each role reads all prior contributions before responding.*\n\n"
-        "*Starting discussion… this may take a moment.*"
+    user_preferred_models[user.id] = model
+    desc, vision = MODEL_INFO.get(model, ("Unknown model", False))
+    vtag = " [vision]" if vision else ""
+    await msg.reply_text(
+        f"✅ Preferred model set to *{model}*{vtag} — {desc}.",
+        parse_mode=ParseMode.MARKDOWN,
     )
-    header_msg = await interaction.followup.send(header)
-    thread = await _create_task_thread(header_msg, f"🏢 {task}"[:100], interaction.channel)
-    send = thread.send if thread else interaction.followup.send
+
+
+# ---------------------------------------------------------------------------
+# AI Company / Build commands
+# ---------------------------------------------------------------------------
+
+
+async def company_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/company <task> [roles:CEO,CTO,...] [interactive:true]"""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if msg is None or chat is None:
+        return
+
+    args_text = " ".join(context.args or "").strip() if context.args else ""
+    if not args_text:
+        await msg.reply_text("Usage: /company <task description>\nOptional: roles:CEO,CTO,... interactive:true")
+        return
+
+    task, role_list, interactive = _parse_company_args(args_text, DEFAULT_ROLES)
+
+    chat_id = chat.id
+    roles_display = ", ".join(role_list)
+    mode_note = " _(interactive)_" if interactive else ""
+
+    header = (
+        f"🏢 *AI Company Discussion*{mode_note}\n"
+        f"📋 *Task:* {task}\n"
+        f"👥 *Participants:* {roles_display}\n\n"
+        "_Starting discussion…_"
+    )
+    await msg.reply_text(header, parse_mode=ParseMode.MARKDOWN)
+
+    async def _send(text: str) -> None:
+        await _send_chunks(chat_id, text, context.bot)
 
     role_done_cb: Optional[Callable] = None
     posts_done_in_cb = False
@@ -1601,26 +1562,12 @@ async def company_slash(
         posts_done_in_cb = True
 
         async def _company_role_cb(role: str, reply: str) -> Optional[str]:
-            logger.info("Company interactive: posting role %r response", role)
             prior_count = role_list.index(role)
-            msg = f"👤 **{role}** {_prior_context_note(prior_count)}\n{reply}"
-            for chunk in split_message(msg):
-                await send(chunk)
+            role_msg = f"👤 *{role}* {_prior_context_note(prior_count)}\n{reply}"
+            await _send(role_msg)
             remaining = role_list[role_list.index(role) + 1:]
             if remaining:
-                view = InterruptView()
-                prompt_msg = await send(
-                    f"*Next up: **{remaining[0]}**.*  "
-                    "Would you like to add your perspective first?",
-                    view=view,
-                )
-                view._message = prompt_msg
-                logger.info("Company interactive: waiting for user input before %r", remaining[0])
-                await view.wait()
-                if view.action == "input" and view.user_input:
-                    preview = view.user_input[:80] + "…" if len(view.user_input) > 80 else view.user_input
-                    await send(f"✅ *Your input noted: \"{preview}\"*")
-                    return view.user_input
+                return await _wait_for_user_choice(chat_id, context.bot, remaining[0])
             return None
 
         role_done_cb = _company_role_cb
@@ -1629,61 +1576,42 @@ async def company_slash(
 
     if not posts_done_in_cb:
         for idx, (role, reply) in enumerate(discussion):
-            msg = f"👤 **{role}** {_prior_context_note(idx)}\n{reply}"
-            for chunk in split_message(msg):
-                await send(chunk)
+            await _send(f"👤 *{role}* {_prior_context_note(idx)}\n{reply}")
 
-    for chunk in split_message(f"---\n✅ **Final Outcome**\n\n{final_outcome}"):
-        await send(chunk)
+    await _send(f"---\n✅ *Final Outcome*\n\n{final_outcome}")
 
 
-@bot.tree.command(
-    name="build",
-    description="Developer team discussion + code generation saved to project/",
-)
-@app_commands.describe(
-    task="Describe what to build",
-    roles="Comma-separated developer roles. Leave blank to pick from a dropdown.",
-    interactive="Pause after each role so you can add your perspective. Default: False.",
-)
-async def build_slash(
-    interaction: discord.Interaction,
-    task: str,
-    roles: str | None = None,
-    interactive: bool = False,
-):
-    await interaction.response.defer(thinking=True)
+async def build_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/build <task> [roles:CTO,...] [interactive:true]"""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if msg is None or chat is None:
+        return
 
-    if roles:
-        role_list = [r.strip() for r in roles.split(",") if r.strip()]
-    else:
-        role_view = RoleSelectView(list(DEFAULT_BUILD_ROLES))
-        await interaction.followup.send(
-            "👥 **Select team roles** *(choose any number, or wait 2 min to use defaults):*",
-            view=role_view,
-            ephemeral=True,
-        )
-        await role_view.wait()
-        role_list = role_view.selected_roles
+    args_text = " ".join(context.args or "").strip() if context.args else ""
+    if not args_text:
+        await msg.reply_text("Usage: /build <task description>\nOptional: roles:CTO,BackendDev,... interactive:true")
+        return
+
+    task, role_list, interactive = _parse_company_args(args_text, DEFAULT_BUILD_ROLES)
+    chat_id = chat.id
 
     async with aiohttp.ClientSession() as _name_session:
         project_slug = await generate_project_name(_name_session, task)
 
-    logger.info("Build | task=%r | project=%s | roles=%s", task, project_slug, role_list)
-
     roles_display = ", ".join(role_list)
-    mode_note = " *(interactive)*" if interactive else ""
+    mode_note = " _(interactive)_" if interactive else ""
     header = (
-        f"🛠️ **AI Developer Team — Build Session**{mode_note}\n"
-        f"📋 **Task:** {task}\n"
-        f"📁 **Project:** `{project_slug}`\n"
-        f"👥 **Team:** {roles_display}\n"
-        f"📡 *Each team member reads all prior contributions before responding.*\n\n"
-        "*Team discussion starting… this may take a moment.*"
+        f"🛠️ *AI Developer Team — Build Session*{mode_note}\n"
+        f"📋 *Task:* {task}\n"
+        f"📁 *Project:* `{project_slug}`\n"
+        f"👥 *Team:* {roles_display}\n\n"
+        "_Team discussion starting…_"
     )
-    header_msg = await interaction.followup.send(header)
-    thread = await _create_task_thread(header_msg, f"🛠️ {project_slug}"[:100], interaction.channel)
-    send = thread.send if thread else interaction.followup.send
+    await msg.reply_text(header, parse_mode=ParseMode.MARKDOWN)
+
+    async def _send(text: str) -> None:
+        await _send_chunks(chat_id, text, context.bot)
 
     role_done_cb: Optional[Callable] = None
     posts_done_in_cb = False
@@ -1692,26 +1620,12 @@ async def build_slash(
         posts_done_in_cb = True
 
         async def _build_role_cb(role: str, reply: str) -> Optional[str]:
-            logger.info("Build interactive: posting role %r response", role)
             prior_count = role_list.index(role)
-            msg = f"👤 **{role}** {_prior_context_note(prior_count)}\n{reply}"
-            for chunk in split_message(msg):
-                await send(chunk)
+            role_msg = f"👤 *{role}* {_prior_context_note(prior_count)}\n{reply}"
+            await _send(role_msg)
             remaining = role_list[role_list.index(role) + 1:]
             if remaining:
-                view = InterruptView()
-                prompt_msg = await send(
-                    f"*Next up: **{remaining[0]}**.*  "
-                    "Would you like to add your perspective first?",
-                    view=view,
-                )
-                view._message = prompt_msg
-                logger.info("Build interactive: waiting for user input before %r", remaining[0])
-                await view.wait()
-                if view.action == "input" and view.user_input:
-                    preview = view.user_input[:80] + "…" if len(view.user_input) > 80 else view.user_input
-                    await send(f"✅ *Your input noted: \"{preview}\"*")
-                    return view.user_input
+                return await _wait_for_user_choice(chat_id, context.bot, remaining[0])
             return None
 
         role_done_cb = _build_role_cb
@@ -1720,88 +1634,72 @@ async def build_slash(
 
     if not posts_done_in_cb:
         for idx, (role, reply) in enumerate(discussion):
-            msg = f"👤 **{role}** {_prior_context_note(idx)}\n{reply}"
-            for chunk in split_message(msg):
-                await send(chunk)
+            await _send(f"👤 *{role}* {_prior_context_note(idx)}\n{reply}")
 
-    for chunk in split_message(f"---\n✅ **Final Plan**\n\n{final_outcome}"):
-        await send(chunk)
+    await _send(f"---\n✅ *Final Plan*\n\n{final_outcome}")
 
-    # Generate code with format-retry + code review
-    code_files, raw_output = await generate_verified_code_files(
-        task, discussion, final_outcome, send
-    )
+    code_files, raw_output = await generate_verified_code_files(task, discussion, final_outcome, _send)
 
     def _store_session(code: list[tuple[str, str]]) -> None:
-        session_dict: dict = {
+        build_sessions[chat_id] = {
             "task": task,
             "discussion": discussion,
             "final_outcome": final_outcome,
             "code_files": code,
             "project_slug": project_slug,
-            "thread_id": thread.id if thread else None,
             "followup_history": [],
         }
-        channel_id = interaction.channel_id or 0
-        build_sessions[channel_id] = session_dict
-        if thread:
-            build_sessions[thread.id] = session_dict
 
     if not code_files:
-        await send(
-            "⚠️ No structured code files were detected in the AI output. "
+        await _send(
+            "⚠️ No structured code files were detected in the AI output.\n"
             "The raw output follows:"
         )
-        for chunk in split_message(raw_output or "*No output.*"):
-            await send(chunk)
+        await _send(raw_output or "_No output._")
         _store_session([])
-        await send("💬 *Use `/followup` to ask questions or request a retry.*")
+        await _send("💬 _Use /followup to ask questions or request a retry._")
         return
 
     files_list = "\n".join(f"• `{fn}`" for fn, _ in code_files)
-    await send(f"📦 **{len(code_files)} file(s) generated:**\n{files_list}\n\n*Saving to GitHub…*")
+    await _send(f"📦 *{len(code_files)} file(s) generated:*\n{files_list}\n\n_Saving to GitHub…_")
 
     committed_urls, folder_url = await commit_project(project_slug, task, final_outcome, code_files)
 
     if committed_urls:
         url_lines = "\n".join(f"• {u}" for u in committed_urls[:20])
-        extra = f"\n*(and {len(committed_urls) - 20} more)*" if len(committed_urls) > 20 else ""
-        folder_line = f"\n\n📂 **Project folder:** {folder_url}" if folder_url else ""
-        await send(f"✅ **Project saved to GitHub!**\n{url_lines}{extra}{folder_line}")
+        extra = f"\n_(and {len(committed_urls) - 20} more)_" if len(committed_urls) > 20 else ""
+        folder_line = f"\n\n📂 *Project folder:* {folder_url}" if folder_url else ""
+        await _send(f"✅ *Project saved to GitHub!*\n{url_lines}{extra}{folder_line}")
     elif GITHUB_TOKEN and GITHUB_REPOSITORY:
-        await send("⚠️ Could not commit files to GitHub. Check the bot logs for details.")
+        await _send("⚠️ Could not commit files to GitHub. Check the bot logs for details.")
     else:
-        await send(
+        await _send(
             "ℹ️ GitHub integration not configured — files were not saved.\n"
             "Set `GITHUB_TOKEN` and `GITHUB_REPOSITORY` to enable saving."
         )
 
     _store_session(code_files)
-    await send("💬 *Session saved. Use `/followup` to ask questions or request amendments.*")
+    await _send("💬 _Session saved. Use /followup to ask questions or request amendments._")
 
 
-_STACK_EMOJI: dict[str, str] = {"python": "🐍", "php": "🐘", "actions": "⚙️"}
+async def autorun_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/autorun [stack:python|php|actions]"""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if msg is None or chat is None:
+        return
 
+    chat_id = chat.id
+    args_text = " ".join(context.args or "").strip() if context.args else ""
+    stack_value: str | None = None
+    if args_text.lower().startswith("stack:"):
+        candidate = args_text[6:].strip().lower()
+        if candidate in _AUTO_STACKS:
+            stack_value = candidate
 
-@bot.tree.command(
-    name="autorun",
-    description="AI picks a task and builds it autonomously; you can steer after each role",
-)
-@app_commands.describe(stack="Preferred tech stack. Leave blank for AI to choose.")
-@app_commands.choices(stack=[
-    app_commands.Choice(name="Python (Flask / FastAPI / CLI)", value="python"),
-    app_commands.Choice(name="PHP + HTML (web app / API)", value="php"),
-    app_commands.Choice(name="GitHub Actions workflow (CI/CD)", value="actions"),
-])
-async def autorun_slash(
-    interaction: discord.Interaction,
-    stack: app_commands.Choice[str] | None = None,
-):
-    await interaction.response.defer(thinking=True)
+    await msg.reply_text("🤖 *AI AutoRun* — generating task…", parse_mode=ParseMode.MARKDOWN)
 
     try:
-        stack_value = stack.value if stack else None
-
         async with aiohttp.ClientSession() as _setup_session:
             task, chosen_stack = await generate_auto_task(_setup_session, stack_value)
             project_slug = await generate_project_name(_setup_session, task)
@@ -1809,159 +1707,188 @@ async def autorun_slash(
         role_list = list(DEFAULT_BUILD_ROLES)
         stack_emoji = _STACK_EMOJI.get(chosen_stack, "💻")
 
-        role_view = RoleSelectView(role_list)
-        await interaction.followup.send(
-            "👥 **Select team roles** *(choose any number, or wait 2 min to use defaults):*",
-            view=role_view,
-            ephemeral=True,
-        )
-        await role_view.wait()
-        role_list = role_view.selected_roles
-
-        logger.info("AutoRun | task=%r | project=%s | stack=%s", task, project_slug, chosen_stack)
-
         header = (
-            f"🤖 **AI AutoRun — Autonomous Build Session**\n"
-            f"📋 **Task:** {task}\n"
-            f"📁 **Project:** `{project_slug}`\n"
-            f"🛠️ **Stack:** {stack_emoji} `{chosen_stack}`\n"
-            f"👥 **Team:** {', '.join(role_list)}\n"
-            f"📡 *Click **✏️ Add My Input** after any role to steer the discussion.*\n\n"
-            "*Team discussion starting… this may take a moment.*"
+            f"🤖 *AI AutoRun — Autonomous Build Session*\n"
+            f"📋 *Task:* {task}\n"
+            f"📁 *Project:* `{project_slug}`\n"
+            f"🛠️ *Stack:* {stack_emoji} `{chosen_stack}`\n"
+            f"👥 *Team:* {', '.join(role_list)}\n\n"
+            "_Team discussion starting…_"
         )
-        header_msg = await interaction.followup.send(header)
-        thread = await _create_task_thread(header_msg, f"🤖 {project_slug}"[:100], interaction.channel)
-        send = thread.send if thread else interaction.followup.send
+        await context.bot.send_message(chat_id=chat_id, text=header, parse_mode=ParseMode.MARKDOWN)
+
+        async def _send(text: str) -> None:
+            await _send_chunks(chat_id, text, context.bot)
 
         async def _autorun_role_cb(role: str, reply: str) -> Optional[str]:
-            logger.info("AutoRun interactive: posting role %r response", role)
             role_idx = role_list.index(role)
-            msg = f"👤 **{role}** {_prior_context_note(role_idx)}\n{reply}"
-            for chunk in split_message(msg):
-                await send(chunk)
+            role_msg = f"👤 *{role}* {_prior_context_note(role_idx)}\n{reply}"
+            await _send(role_msg)
             remaining = role_list[role_idx + 1:]
             if remaining:
-                view = InterruptView()
-                prompt_msg = await send(
-                    f"*Next: **{remaining[0]}** — continuing in 90 s…*  "
-                    "Want to add your input first?",
-                    view=view,
-                )
-                view._message = prompt_msg
-                logger.info("AutoRun interactive: waiting for user input before %r", remaining[0])
-                await view.wait()
-                if view.action == "input" and view.user_input:
-                    preview = view.user_input[:80] + "…" if len(view.user_input) > 80 else view.user_input
-                    await send(f"✅ *Your input noted: \"{preview}\"*")
-                    return view.user_input
+                return await _wait_for_user_choice(chat_id, context.bot, remaining[0])
             return None
 
         discussion, final_outcome = await run_company_discussion(task, role_list, role_done_cb=_autorun_role_cb)
 
-        for chunk in split_message(f"---\n✅ **Final Plan**\n\n{final_outcome}"):
-            await send(chunk)
+        await _send(f"---\n✅ *Final Plan*\n\n{final_outcome}")
 
-        # Generate code with format-retry + code review
-        code_files, raw_output = await generate_verified_code_files(
-            task, discussion, final_outcome, send
-        )
+        code_files, raw_output = await generate_verified_code_files(task, discussion, final_outcome, _send)
 
         def _store_session(code: list[tuple[str, str]]) -> None:
-            session_obj: dict = {
+            build_sessions[chat_id] = {
                 "task": task,
                 "discussion": discussion,
                 "final_outcome": final_outcome,
                 "code_files": code,
                 "project_slug": project_slug,
-                "thread_id": thread.id if thread else None,
                 "followup_history": [],
             }
-            channel_id = interaction.channel_id or 0
-            build_sessions[channel_id] = session_obj
-            if thread:
-                build_sessions[thread.id] = session_obj
 
         if not code_files:
-            await send("⚠️ No structured code files detected. The raw output follows:")
-            for chunk in split_message(raw_output or "*No output.*"):
-                await send(chunk)
+            await _send("⚠️ No structured code files detected. The raw output follows:")
+            await _send(raw_output or "_No output._")
             _store_session([])
-            await send("💬 *Use `/followup` to ask questions or request a retry.*")
+            await _send("💬 _Use /followup to ask questions or request a retry._")
             return
 
         files_list = "\n".join(f"• `{fn}`" for fn, _ in code_files)
-        await send(f"📦 **{len(code_files)} file(s) generated:**\n{files_list}\n\n*Saving to GitHub…*")
+        await _send(f"📦 *{len(code_files)} file(s) generated:*\n{files_list}\n\n_Saving to GitHub…_")
 
         committed_urls, folder_url = await commit_project(project_slug, task, final_outcome, code_files)
 
         if committed_urls:
             url_lines = "\n".join(f"• {u}" for u in committed_urls[:20])
-            extra = f"\n*(and {len(committed_urls) - 20} more)*" if len(committed_urls) > 20 else ""
-            folder_line = f"\n\n📂 **Project folder:** {folder_url}" if folder_url else ""
-            await send(f"✅ **Project saved to GitHub!**\n{url_lines}{extra}{folder_line}")
+            extra = f"\n_(and {len(committed_urls) - 20} more)_" if len(committed_urls) > 20 else ""
+            folder_line = f"\n\n📂 *Project folder:* {folder_url}" if folder_url else ""
+            await _send(f"✅ *Project saved to GitHub!*\n{url_lines}{extra}{folder_line}")
         elif GITHUB_TOKEN and GITHUB_REPOSITORY:
-            await send("⚠️ Could not commit files to GitHub. Check bot logs for details.")
+            await _send("⚠️ Could not commit files to GitHub. Check bot logs for details.")
         else:
-            await send(
+            await _send(
                 "ℹ️ GitHub integration not configured — files were not saved.\n"
                 "Set `GITHUB_TOKEN` and `GITHUB_REPOSITORY` to enable saving."
             )
 
         _store_session(code_files)
-        await send("💬 *AutoRun session saved. Use `/followup` to ask questions or request amendments.*")
+        await _send("💬 _AutoRun session saved. Use /followup to ask questions or request amendments._")
 
     except Exception as exc:
         logger.error("AutoRun failed: %s", exc, exc_info=True)
-        try:
-            await interaction.followup.send(f"❌ AutoRun encountered an error: {exc}")
-        except Exception:
-            pass
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ AutoRun encountered an error: {exc}")
 
 
-@bot.tree.command(name="company_roles", description="List all available roles for /company and /build")
-async def company_roles_slash(interaction: discord.Interaction):
-    await interaction.response.defer()
-    lines = ["**🏢 Available Company Roles**", "", "**Default roles** (for `/company`):"]
+async def company_roles_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/company_roles — list available roles."""
+    msg = update.effective_message
+    if msg is None:
+        return
+    lines = ["🏢 *Available Company Roles*", "", "*Default roles* (for /company):"]
     for role in DEFAULT_ROLES:
         lines.append(f"• `{role}`")
-    lines += ["", "**Default developer team** (for `/build` and `/autorun`):"]
+    lines += ["", "*Default developer team* (for /build and /autorun):"]
     for role in DEFAULT_BUILD_ROLES:
         lines.append(f"• `{role}`")
-    lines += ["", "**All built-in roles:**"]
+    lines += ["", "*All built-in roles:*"]
     for role, prompt in ROLE_PROMPTS.items():
         sentences = prompt.split(". ")
         focus = sentences[1].lstrip("Focus on ") if len(sentences) > 1 else ""
         lines.append(f"• `{role}` — {focus}")
     lines += [
         "",
-        "**Custom roles** — supply any role name not in the list above.",
+        "*Custom roles* — supply any role name not in the list above.",
         "The bot generates a suitable system prompt automatically.",
     ]
     content = "\n".join(lines)
-    for chunk in split_message(content):
-        await interaction.followup.send(chunk)
+    chat = update.effective_chat
+    if chat is None:
+        return
+    await _send_chunks(chat.id, content, context.bot)
 
 
 # ---------------------------------------------------------------------------
-# Universal /followup — context-aware continuation command
+# /followup — context-aware continuation
 # ---------------------------------------------------------------------------
+
+
+async def followup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/followup <request> — steer active stream, amend build session, or continue chat."""
+    msg = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if msg is None or user is None or chat is None:
+        return
+
+    request = " ".join(context.args or "").strip() if context.args else ""
+    if not request:
+        await msg.reply_text("Usage: /followup <your request or question>")
+        return
+
+    chat_id = chat.id
+
+    # ── Priority 1: cancel any active streaming request and redirect it ────
+    existing_task = active_requests.pop(user.id, None)
+    if existing_task and not existing_task.done():
+        existing_task.cancel()
+        history = conversation_history.get(chat_id, [])
+        preferred = user_preferred_models.get(user.id)
+
+        preview = request[:80] + "…" if len(request) > 80 else request
+        await msg.reply_text(f"✏️ _Previous request cancelled — redirecting: \"{preview}\"…_", parse_mode=ParseMode.MARKDOWN)
+
+        task = asyncio.create_task(
+            _stream_to_message(request, chat_id, context.bot, preferred, history, None)
+        )
+        active_requests[user.id] = task
+        try:
+            reply, model_used, is_fallback = await task
+        except asyncio.CancelledError:
+            await context.bot.send_message(chat_id=chat_id, text="⛔ Interrupted.")
+            return
+        finally:
+            active_requests.pop(user.id, None)
+
+        if model_used:
+            _update_history(chat_id, request, reply)
+        return
+
+    # ── Priority 2: active build session → build follow-up ─────────────────
+    session_data = build_sessions.get(chat_id)
+    if session_data:
+        await _do_build_followup(chat_id, request, session_data, context.bot)
+        return
+
+    # ── Priority 3: no active request, no build session → general chat ─────
+    history = conversation_history.get(chat_id, [])
+    preferred = user_preferred_models.get(user.id)
+
+    task = asyncio.create_task(
+        _stream_to_message(request, chat_id, context.bot, preferred, history, msg.message_id)
+    )
+    active_requests[user.id] = task
+    try:
+        reply, model_used, _ = await task
+    except asyncio.CancelledError:
+        await context.bot.send_message(chat_id=chat_id, text="⛔ Request cancelled.")
+        return
+    finally:
+        active_requests.pop(user.id, None)
+
+    if model_used:
+        _update_history(chat_id, request, reply)
 
 
 async def _do_build_followup(
-    interaction: discord.Interaction,
+    chat_id: int,
     request: str,
     session_data: dict,
+    bot: Bot,
 ) -> None:
-    """Perform a build-session follow-up.
-
-    Uses a per-channel asyncio.Lock so that rapid successive /followup
-    invocations are serialised rather than racing on the shared session.
-    """
-    channel_key = interaction.channel_id or 0
-    lock = followup_locks.setdefault(channel_key, asyncio.Lock())
+    """Perform a build-session follow-up (serialised per chat)."""
+    lock = followup_locks.setdefault(chat_id, asyncio.Lock())
 
     async with lock:
-        task = session_data["task"]
+        task_desc = session_data["task"]
         discussion: list[tuple[str, str]] = session_data["discussion"]
         final_outcome: str = session_data["final_outcome"]
         code_files: list[tuple[str, str]] = session_data.get("code_files", [])
@@ -1973,30 +1900,29 @@ async def _do_build_followup(
             len(followup_history) + 1, project_slug, request,
         )
 
-        context = f"**Original Task:** {task}\n\n**Developer Team Discussion:**\n"
+        context_str = f"*Original Task:* {task_desc}\n\n*Developer Team Discussion:*\n"
         for role, reply in discussion:
-            context += f"\n**{role}:** {reply}\n"
-        context += f"\n**Final Plan:**\n{final_outcome}\n"
+            context_str += f"\n*{role}:* {reply}\n"
+        context_str += f"\n*Final Plan:*\n{final_outcome}\n"
 
         if code_files:
-            context += "\n**Previously Generated Files:**\n"
+            context_str += "\n*Previously Generated Files:*\n"
             for filename, content in code_files:
                 preview = content[:600] + "\n…(truncated)" if len(content) > 600 else content
-                context += f"\n### File: {filename}\n```\n{preview}\n```\n"
+                context_str += f"\n### File: {filename}\n```\n{preview}\n```\n"
 
         if followup_history:
-            context += "\n**Previous Follow-up Conversation:**\n"
-            # Include up to the last 10 exchanges for richer context
+            context_str += "\n*Previous Follow-up Conversation:*\n"
             for i, exchange in enumerate(followup_history[-10:], 1):
-                context += f"\nQ{i}: {exchange['request']}\n"
+                context_str += f"\nQ{i}: {exchange['request']}\n"
                 reply_preview = exchange["reply"][:500]
                 if len(exchange["reply"]) > 500:
                     reply_preview += "\n…(truncated)"
-                context += f"A{i}: {reply_preview}\n"
+                context_str += f"A{i}: {reply_preview}\n"
 
         followup_prompt = (
-            f"{context}\n\n"
-            f"**Follow-up Request #{len(followup_history) + 1}:** {request}\n\n"
+            f"{context_str}\n\n"
+            f"*Follow-up Request #{len(followup_history) + 1}:* {request}\n\n"
             "Answer clearly. If modifying code use the `### File: <filename>` / ``` format."
         )
         messages = [
@@ -2016,29 +1942,12 @@ async def _do_build_followup(
                 reply = await call_ai(http_session, messages)
             except Exception as exc:
                 logger.error("Follow-up AI call failed: %s", exc)
-                await interaction.followup.send("⚠️ AI request failed. Please try again.")
+                await bot.send_message(chat_id=chat_id, text="⚠️ AI request failed. Please try again.")
                 return
 
-        # Route to build thread when available
-        thread_id = session_data.get("thread_id")
-        send = interaction.followup.send
-        if thread_id:
-            try:
-                thread_channel = bot.get_channel(thread_id) or await bot.fetch_channel(thread_id)
-                # Only redirect when we know the user is in a different channel.
-                # If interaction.channel_id is None (edge case), stay with followup.send.
-                if interaction.channel_id is not None and interaction.channel_id != thread_channel.id:
-                    send = thread_channel.send  # type: ignore[assignment]
-                    await interaction.followup.send(
-                        "💬 *Responding in the build thread…*", ephemeral=True
-                    )
-            except Exception as exc:
-                logger.warning("Could not retrieve build thread %s: %s", thread_id, exc)
-
         followup_num = len(followup_history) + 1
-        await send(f"💬 **Follow-up #{followup_num}:** {request[:120]}")
-        for chunk in split_message(reply):
-            await send(chunk)
+        await bot.send_message(chat_id=chat_id, text=f"💬 *Follow-up #{followup_num}:* {request[:120]}", parse_mode=ParseMode.MARKDOWN)
+        await _send_chunks(chat_id, reply, bot)
 
         followup_history.append({"request": request, "reply": reply})
 
@@ -2050,155 +1959,115 @@ async def _do_build_followup(
             session_data["code_files"] = list(existing.items())
 
             if GITHUB_TOKEN and GITHUB_REPOSITORY:
-                await send(f"📝 *{len(amended_files)} file(s) amended. Saving to GitHub…*")
-                committed_urls, _ = await commit_project(project_slug, task, final_outcome, amended_files)
+                await bot.send_message(chat_id=chat_id, text=f"📝 _{len(amended_files)} file(s) amended. Saving to GitHub…_", parse_mode=ParseMode.MARKDOWN)
+                committed_urls, _ = await commit_project(project_slug, task_desc, final_outcome, amended_files)
                 if committed_urls:
                     url_lines = "\n".join(f"• {u}" for u in committed_urls[:10])
-                    extra = f"\n*(and {len(committed_urls) - 10} more)*" if len(committed_urls) > 10 else ""
-                    await send(f"✅ **Amendments saved to GitHub:**\n{url_lines}{extra}")
+                    extra = f"\n_(and {len(committed_urls) - 10} more)_" if len(committed_urls) > 10 else ""
+                    await bot.send_message(chat_id=chat_id, text=f"✅ *Amendments saved to GitHub:*\n{url_lines}{extra}", parse_mode=ParseMode.MARKDOWN)
                 else:
-                    await send("⚠️ Could not commit amended files to GitHub.")
+                    await bot.send_message(chat_id=chat_id, text="⚠️ Could not commit amended files to GitHub.")
             else:
                 files_list = "\n".join(f"• `{fn}`" for fn, _ in amended_files)
-                await send(
-                    f"📝 *{len(amended_files)} file(s) included above:*\n{files_list}\n"
-                    "*(GitHub integration not configured — files not saved automatically.)*"
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"📝 _{len(amended_files)} file(s) included above:_\n{files_list}\n"
+                        "_(GitHub integration not configured — files not saved automatically.)_"
+                    ),
+                    parse_mode=ParseMode.MARKDOWN,
                 )
 
 
-@bot.tree.command(
-    name="followup",
-    description="Steer an active AI stream, amend a build session, or continue the chat conversation",
-)
-@app_commands.describe(
-    request="Your question, amendment request, or perspective for the AI"
-)
-async def followup_slash(interaction: discord.Interaction, request: str):
-    await interaction.response.defer(thinking=True)
-
-    # ── Priority 1: cancel any active streaming request and redirect it ────
-    existing_task = active_requests.pop(interaction.user.id, None)
-    if existing_task and not existing_task.done():
-        existing_task.cancel()
-
-        history_key = interaction.channel_id if interaction.channel_id is not None else interaction.user.id
-        history = conversation_history.get(history_key, [])
-        preferred = user_preferred_models.get(interaction.user.id)
-
-        if len(request) > 80:
-            cut = request[:80].rsplit(None, 1)[0] if " " in request[:80] else request[:80]
-            preview = cut + "…"
-        else:
-            preview = request
-
-        placeholder_msg = await interaction.followup.send(
-            f"✏️ *Previous request cancelled — redirecting: \"{preview}\"…* ▌"
-        )
-
-        async def _progress_redirect(text: str) -> None:
-            display = text[-STREAM_DISPLAY_LIMIT:] + "▌" if len(text) > STREAM_DISPLAY_LIMIT else text + "▌"
-            try:
-                await placeholder_msg.edit(content=display)
-            except discord.HTTPException:
-                pass
-
-        new_task = asyncio.create_task(
-            get_ai_reply_streaming(request, preferred, history=history, progress_cb=_progress_redirect)
-        )
-        active_requests[interaction.user.id] = new_task
-        try:
-            reply, model_used, is_fallback = await new_task
-        except asyncio.CancelledError:
-            await placeholder_msg.edit(content="⛔ Interrupted.")
-            return
-        finally:
-            active_requests.pop(interaction.user.id, None)
-
-        if model_used:
-            _update_history(history_key, request, reply)
-        display_reply = reply + _fallback_footer(model_used, preferred, is_fallback)
-        header = f"✏️ *Redirected based on: \"{preview}\"*\n\n"
-        chunks = split_message(header + display_reply)
-        await placeholder_msg.edit(content=chunks[0])
-        for chunk in chunks[1:]:
-            await interaction.followup.send(chunk)
-        return
-
-    # ── Priority 2: active build session → build follow-up ─────────────────
-    channel_id = interaction.channel_id or 0
-    session_data = build_sessions.get(channel_id)
-    if not session_data:
-        ch = interaction.channel
-        if isinstance(ch, discord.Thread) and ch.parent_id:
-            session_data = build_sessions.get(ch.parent_id)
-
-    if session_data:
-        await _do_build_followup(interaction, request, session_data)
-        return
-
-    # ── Priority 3: no active request, no build session → general chat ─────
-    history_key = interaction.channel_id if interaction.channel_id is not None else interaction.user.id
-    history = conversation_history.get(history_key, [])
-    preferred = user_preferred_models.get(interaction.user.id)
-
-    placeholder_msg = await interaction.followup.send("▌")
-
-    async def _on_progress(text: str) -> None:
-        display = text[-STREAM_DISPLAY_LIMIT:] + "▌" if len(text) > STREAM_DISPLAY_LIMIT else text + "▌"
-        try:
-            await placeholder_msg.edit(content=display)
-        except discord.HTTPException:
-            pass
-
-    t = asyncio.create_task(
-        get_ai_reply_streaming(request, preferred, history=history, progress_cb=_on_progress)
-    )
-    active_requests[interaction.user.id] = t
-    try:
-        reply, model_used, is_fallback = await t
-    except asyncio.CancelledError:
-        await placeholder_msg.edit(content="⛔ Request cancelled.")
-        return
-    finally:
-        active_requests.pop(interaction.user.id, None)
-
-    if model_used:
-        _update_history(history_key, request, reply)
-    display_reply = reply + _fallback_footer(model_used, preferred, is_fallback)
-    chunks = split_message(display_reply)
-    await placeholder_msg.edit(content=chunks[0])
-    for chunk in chunks[1:]:
-        await interaction.followup.send(chunk)
-
-
 # ---------------------------------------------------------------------------
-# Weather slash command
+# Interactive callback query handler
 # ---------------------------------------------------------------------------
 
 
-@bot.tree.command(
-    name="weather",
-    description="Get current Hong Kong weather and AI clothing suggestions",
-)
-async def weather_slash(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
+async def interactive_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Continue / Add Input button presses during interactive sessions."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+
+    data = query.data or ""
+    if data.startswith("interactive_continue:"):
+        chat_id = int(data.split(":")[1])
+        key = f"interactive:{chat_id}"
+        fut = _interactive_futures.get(key)
+        if fut and not fut.done():
+            fut.set_result(None)
+        await query.edit_message_text("▶ Continuing…")
+
+    elif data.startswith("interactive_input:"):
+        chat_id = int(data.split(":")[1])
+        key = f"interactive:{chat_id}"
+        fut = _interactive_futures.get(key)
+        if fut:
+            # Ask user to type their input as a reply in the chat
+            await query.edit_message_text(
+                "✏️ Please type your input/perspective and send it as a reply. "
+                "I'll include it in the discussion."
+            )
+            # Register a one-time text listener for this chat
+            context.chat_data["awaiting_interactive_input"] = key  # type: ignore[index]
+
+
+async def interactive_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Capture text input typed by user during interactive sessions.
+
+    Runs in handler group 0 (higher priority).  Raises ApplicationHandlerStop
+    when it consumes the message so the general chat handler in group 1 is skipped.
+    """
+    msg = update.effective_message
+    if msg is None:
+        return
+    key = context.chat_data.get("awaiting_interactive_input")  # type: ignore[union-attr]
+    if not key:
+        return  # not waiting for input — let group 1 handle it normally
+    del context.chat_data["awaiting_interactive_input"]  # type: ignore[union-attr]
+
+    fut = _interactive_futures.get(key)
+    if fut and not fut.done():
+        fut.set_result(msg.text or "")
+        await msg.reply_text(f"✅ _Your input noted: \"{(msg.text or '')[:80]}\"_", parse_mode=ParseMode.MARKDOWN)
+    raise ApplicationHandlerStop  # prevent the general chat handler from also firing
+
+
+# ---------------------------------------------------------------------------
+# Weather command
+# ---------------------------------------------------------------------------
+
+
+async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/weather — current HK weather + AI clothing suggestions."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if msg is None or chat is None:
+        return
+
+    await msg.reply_text("🌤️ Fetching Hong Kong weather…")
 
     weather = await fetch_hk_weather()
     if not weather:
-        await interaction.followup.send(
-            "⚠️ Could not fetch current weather data from HKO. Please try again later.\n"
-            f"*(Source: <{HKO_RSS_URL}>)*"
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=(
+                "⚠️ Could not fetch current weather data from HKO. Please try again later.\n"
+                f"_(Source: {HKO_RSS_URL})_"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
     suggestion = await get_weather_clothing_suggestion(weather)
-    msg = _build_weather_message(weather, suggestion)
-    for chunk in split_message(msg):
-        await interaction.followup.send(chunk)
+    weather_msg = _build_weather_message(weather, suggestion)
+    await _send_chunks(chat.id, weather_msg, context.bot)
 
 
 # ---------------------------------------------------------------------------
-# Unified /about
+# /about
 # ---------------------------------------------------------------------------
 
 
@@ -2206,57 +2075,91 @@ def _build_about_message() -> str:
     default_roles_str = ", ".join(DEFAULT_ROLES)
     build_roles_str = ", ".join(DEFAULT_BUILD_ROLES)
     return (
-        "**🤖 Unified AI Bot — How to Use**\n\n"
-        "**💬 General Chat**\n"
-        "Mention me in any channel, send a DM, or just reply in a thread I started — "
-        "no need to re-mention me for follow-up messages.\n"
-        "Prefix with `@<model>` to pick a model, or `@about` to show this guide.\n\n"
-        "**⚡ Chat Slash Commands**\n"
-        "• `/ask question:[…] model:[optional]` — Ask a question with streaming\n"
+        "🤖 *Unified AI Telegram Bot — How to Use*\n\n"
+        "💬 *General Chat*\n"
+        "• Message me directly (DM) and I'll reply with AI.\n"
+        "• In groups: mention me with @username to chat.\n\n"
+        "⚡ *Chat Commands*\n"
+        "• `/ask <question>` — Ask a question (live streaming)\n"
+        "• `/ask model:<name> <question>` — Use a specific model\n"
         "• `/cancel` — Cancel your in-progress request\n"
         "• `/models` — List available AI models\n"
-        "• `/settings model:[optional]` — View or set your preferred model\n\n"
-        "**🏢 AI Company / Build**\n"
-        "• `/company task:[…]` — Multi-role company discussion\n"
-        "• `/company task:[…] roles:[CEO,CTO,…] interactive:True` — Interactive mode\n"
-        "• `/build task:[…]` — Dev team discussion + code gen → saved to `project/`\n"
-        "• `/build task:[…] roles:[…] interactive:True` — Interactive build\n"
+        "• `/settings <model>` — Set your preferred model\n\n"
+        "🏢 *AI Company / Build*\n"
+        "• `/company <task>` — Multi-role company discussion\n"
+        "• `/company <task> roles:CEO,CTO,... interactive:true` — Interactive mode\n"
+        "• `/build <task>` — Dev team discussion + code gen → saved to `project/`\n"
+        "• `/build <task> roles:... interactive:true` — Interactive build\n"
         "• `/autorun` — AI picks a task and builds it end-to-end\n"
+        "• `/autorun stack:python` — Force a stack (python / php / actions)\n"
         "• `/company_roles` — List available roles\n\n"
-        "**🔄 Code Review** (automatic after `/build`/`/autorun`)\n"
-        "A reviewer AI checks code and regenerates with feedback (up to 2 rounds). "
-        "Output not using `### File:` format is retried up to 3 times.\n\n"
-        "**🌤️ Weather**\n"
+        "🔄 *Code Review* (automatic after /build / /autorun)\n"
+        "A reviewer AI checks code and regenerates with feedback (up to 2 rounds).\n\n"
+        "🌤️ *Weather*\n"
         "• `/weather` — Current HK weather (HKO) + AI clothing suggestions\n"
-        "Auto-reminders: set `WEATHER_CHANNEL_ID` and `WEATHER_REMINDER_HOURS` env vars.\n\n"
-        "**🔗 `/followup`** — works in any context:\n"
+        "Auto-reminders: set `WEATHER_CHAT_ID` and `WEATHER_REMINDER_HOURS` env vars.\n\n"
+        "🔗 */followup <request>* — context-aware:\n"
         "1. Active stream → cancel & redirect to new topic\n"
-        "2. After `/build`/`/autorun` → amend code or ask questions "
-        "(supports unlimited chained follow-ups; each one has full prior context)\n"
+        "2. After /build / /autorun → amend code or ask questions\n"
+        "   (supports unlimited chained follow-ups with full prior context)\n"
         "3. Otherwise → continue general chat conversation\n\n"
-        f"**👥 Default Company Roles:** {default_roles_str}\n"
-        f"**🛠️ Default Dev Team:** {build_roles_str}\n\n"
-        "**💡 Examples**\n"
+        f"👥 *Default Company Roles:* {default_roles_str}\n"
+        f"🛠️ *Default Dev Team:* {build_roles_str}\n\n"
+        "💡 *Examples*\n"
         "```\n"
-        "/ask question:Explain async/await in Python\n"
-        "/company task:Build a food delivery app\n"
-        "/build task:REST API for a todo app interactive:True\n"
+        "/ask Explain async/await in Python\n"
+        "/company Build a food delivery app\n"
+        "/build Create a REST API for a todo app interactive:true\n"
         "/autorun stack:python\n"
-        "/followup request:Add JWT authentication\n"
-        "/followup request:Now add rate limiting\n"
-        "/followup request:Can you write unit tests?\n"
+        "/followup Add JWT authentication\n"
+        "/followup Now add rate limiting\n"
         "/weather\n"
         "```"
     )
 
 
-@bot.tree.command(name="about", description="Show a guide for all bot features")
-async def about_slash(interaction: discord.Interaction):
-    msg = _build_about_message()
-    chunks = split_message(msg)
-    await interaction.response.send_message(chunks[0])
-    for chunk in chunks[1:]:
-        await interaction.followup.send(chunk)
+async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/about — show bot help guide."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if msg is None or chat is None:
+        return
+    await _send_chunks(chat.id, _build_about_message(), context.bot)
+
+
+# ---------------------------------------------------------------------------
+# Argument parser for /company and /build
+# ---------------------------------------------------------------------------
+
+
+def _parse_company_args(
+    text: str,
+    default_roles: list[str],
+) -> tuple[str, list[str], bool]:
+    """Parse shared argument format for /company and /build.
+
+    Supported format:
+        <task text> [roles:<r1,r2,...>] [interactive:true]
+    """
+    interactive = False
+    role_list = list(default_roles)
+
+    # Extract interactive flag
+    m = re.search(r"\binteractive\s*:\s*(true|yes|1)\b", text, re.IGNORECASE)
+    if m:
+        interactive = True
+        text = (text[:m.start()] + text[m.end():]).strip()
+
+    # Extract roles
+    m = re.search(r"\broles\s*:\s*([^\s]+)", text, re.IGNORECASE)
+    if m:
+        roles_str = m.group(1)
+        parsed = [r.strip() for r in roles_str.split(",") if r.strip()]
+        if parsed:
+            role_list = parsed
+        text = (text[:m.start()] + text[m.end():]).strip()
+
+    return text.strip(), role_list, interactive
 
 
 # ---------------------------------------------------------------------------
@@ -2264,14 +2167,12 @@ async def about_slash(interaction: discord.Interaction):
 # ---------------------------------------------------------------------------
 
 
-@tasks.loop(minutes=30)
-async def weather_reminder_task() -> None:
-    """Post an auto weather reminder to the configured channel.
+async def _weather_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Post an auto weather reminder to the configured chat.
 
-    Runs every 30 minutes; sends at most once per configured HKT hour to avoid
-    double-posting when the 30-minute tick straddles an hour boundary.
+    Scheduled every 30 minutes; sends at most once per configured HKT hour.
     """
-    if not WEATHER_CHANNEL_ID or not WEATHER_REMINDER_HOURS:
+    if not WEATHER_CHAT_ID or not WEATHER_REMINDER_HOURS:
         return
 
     hkt_now = datetime.datetime.now(_HKT)
@@ -2282,23 +2183,12 @@ async def weather_reminder_task() -> None:
     if current_key in _weather_sent_hours:
         return
 
-    # Mark as sent *before* the network call to avoid a second post if the
-    # task fires again while the API request is still in flight.
     _weather_sent_hours.add(current_key)
 
-    # Prune entries older than 2 days to avoid unbounded growth.
     cutoff = hkt_now.toordinal() - 2
     for key in list(_weather_sent_hours):
         if key[0] < cutoff:
             _weather_sent_hours.discard(key)
-
-    channel = bot.get_channel(WEATHER_CHANNEL_ID)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(WEATHER_CHANNEL_ID)
-        except Exception as exc:
-            logger.warning("Weather reminder: channel %s not found: %s", WEATHER_CHANNEL_ID, exc)
-            return
 
     weather = await fetch_hk_weather()
     if not weather:
@@ -2306,20 +2196,77 @@ async def weather_reminder_task() -> None:
         return
 
     suggestion = await get_weather_clothing_suggestion(weather)
-    header = f"⏰ **今日天氣提醒 / Weather Reminder — Hong Kong** ({hkt_now.strftime('%H:%M')} HKT)"
-    msg = _build_weather_message(weather, suggestion, header=header)
+    header = f"⏰ *今日天氣提醒 / Weather Reminder — Hong Kong* ({hkt_now.strftime('%H:%M')} HKT)"
+    weather_msg = _build_weather_message(weather, suggestion, header=header)
 
     try:
-        for chunk in split_message(msg):
-            await channel.send(chunk)
-        logger.info("Weather reminder sent to channel %s", WEATHER_CHANNEL_ID)
+        await _send_chunks(WEATHER_CHAT_ID, weather_msg, context.bot)
+        logger.info("Weather reminder sent to chat %s", WEATHER_CHAT_ID)
     except Exception as exc:
         logger.warning("Weather reminder: failed to send message: %s", exc)
 
 
-@weather_reminder_task.before_loop
-async def before_weather_reminder():
-    await bot.wait_until_ready()
+# ---------------------------------------------------------------------------
+# Build the Application
+# ---------------------------------------------------------------------------
+
+
+def _build_application() -> Application:
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .build()
+    )
+
+    # Commands
+    app.add_handler(CommandHandler("ask", ask_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler("models", models_command))
+    app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("company", company_command))
+    app.add_handler(CommandHandler("build", build_command))
+    app.add_handler(CommandHandler("autorun", autorun_command))
+    app.add_handler(CommandHandler("company_roles", company_roles_command))
+    app.add_handler(CommandHandler("followup", followup_command))
+    app.add_handler(CommandHandler("weather", weather_command))
+    app.add_handler(CommandHandler("about", about_command))
+    app.add_handler(CommandHandler("start", about_command))
+
+    # Callback queries for interactive mode
+    app.add_handler(CallbackQueryHandler(interactive_callback_handler, pattern=r"^interactive_"))
+
+    # Interactive input capture (group 0 — higher priority).
+    # Raises ApplicationHandlerStop when it consumes the message, preventing
+    # the general chat handler in group 1 from also firing.
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, interactive_text_handler),
+        group=0,
+    )
+
+    # General chat — DMs and group @mentions (group 1).
+    app.add_handler(
+        MessageHandler(
+            (filters.TEXT | filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND,
+            _on_message_handler,
+        ),
+        group=1,
+    )
+
+    # Weather reminder job (every 30 minutes)
+    if WEATHER_CHAT_ID and WEATHER_REMINDER_HOURS:
+        app.job_queue.run_repeating(  # type: ignore[union-attr]
+            _weather_reminder_job,
+            interval=1800,
+            first=60,
+        )
+        logger.info(
+            "Weather reminders enabled: chat=%s hours=%s HKT",
+            WEATHER_CHAT_ID, WEATHER_REMINDER_HOURS,
+        )
+    else:
+        logger.info("Weather reminders disabled (WEATHER_CHAT_ID not set).")
+
+    return app
 
 
 # ---------------------------------------------------------------------------
@@ -2327,33 +2274,23 @@ async def before_weather_reminder():
 # ---------------------------------------------------------------------------
 
 
-def main():
-    if not DISCORD_TOKEN:
+def main() -> None:
+    if not TELEGRAM_TOKEN:
         logger.error(
-            "DISCORD_TOKEN (or DISCORD_TOKEN_COMPANY) is not set. "
-            "Add it as an environment variable before starting the bot."
+            "TELEGRAM_TOKEN is not set. "
+            "Create a bot via @BotFather on Telegram and set the token as an environment variable."
         )
         raise SystemExit(1)
     if not POLLINATIONS_TOKEN:
         logger.error(
             "POLLINATIONS_TOKEN is not set. "
-            "Add it as an environment variable before starting the bot."
+            "Get your key from https://enter.pollinations.ai and set it as an environment variable."
         )
         raise SystemExit(1)
-    try:
-        bot.run(DISCORD_TOKEN)
-    except discord.errors.LoginFailure as exc:
-        logger.error("Failed to log in to Discord: %s", exc)
-        raise SystemExit(1) from exc
-    except discord.errors.PrivilegedIntentsRequired as exc:
-        logger.error(
-            "The bot requires the 'Message Content' privileged intent, which has not been "
-            "enabled in the Discord Developer Portal. "
-            "Go to https://discord.com/developers/applications/, open your application, "
-            "navigate to the 'Bot' page, and enable 'Message Content Intent' under "
-            "'Privileged Gateway Intents', then restart the bot."
-        )
-        raise SystemExit(1) from exc
+
+    app = _build_application()
+    logger.info("Starting Telegram bot (polling)…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
