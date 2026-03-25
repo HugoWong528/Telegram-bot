@@ -128,7 +128,7 @@ MODEL_CHAIN = [
 ]
 
 TELEGRAM_MAX_LENGTH = 4096
-STREAM_EDIT_INTERVAL = 2.0   # seconds between live edit updates
+STREAM_EDIT_INTERVAL = 1.0   # seconds between live edit updates
 STREAM_DISPLAY_LIMIT = 4000  # chars shown in a streaming placeholder
 MAX_HISTORY = 20             # max conversation messages per chat
 
@@ -288,6 +288,9 @@ user_preferred_models: dict[int, str] = {}
 
 # Per-user active streaming tasks (used by /cancel and /followup interrupt mode).
 active_requests: dict[int, asyncio.Task] = {}
+
+# User IDs whose CancelledError should be handled silently (redirected by /followup).
+_silenced_cancels: set[int] = set()
 
 # Per-chat asyncio locks for build-session follow-ups.
 # Prevents two concurrent /followup invocations from racing on the same session.
@@ -1228,12 +1231,38 @@ async def commit_project(
 # ---------------------------------------------------------------------------
 
 
-async def _safe_edit_text(msg: Message, text: str) -> None:
-    """Edit a Telegram message, ignoring 'message is not modified' errors."""
+def _is_parse_error(exc: BadRequest) -> bool:
+    """Return True when *exc* indicates a Telegram message-entity parsing failure."""
+    err = str(exc).lower()
+    return (
+        "can't parse" in err
+        or "parse entities" in err
+        or "parse mode" in err
+        or ("entity" in err and "parse" in err)
+        or "bad request: message text is empty" in err  # occasionally triggered by bad markdown
+    )
+
+
+async def _safe_edit_text(msg: Message, text: str, parse_mode: str | None = None) -> None:
+    """Edit a Telegram message, ignoring 'message is not modified' errors.
+
+    If *parse_mode* is supplied and Telegram rejects the formatting, retries
+    once without parse_mode so the raw text is always delivered.
+    """
     try:
-        await msg.edit_text(text)
+        await msg.edit_text(text, parse_mode=parse_mode)
     except BadRequest as exc:
-        if "not modified" not in str(exc).lower():
+        err = str(exc).lower()
+        if "not modified" in err:
+            return
+        if parse_mode and _is_parse_error(exc):
+            # Formatting rejected — fall back to plain text
+            try:
+                await msg.edit_text(text)
+            except BadRequest as exc2:
+                if "not modified" not in str(exc2).lower():
+                    logger.debug("edit_text (plain fallback) failed: %s", exc2)
+        else:
             logger.debug("edit_text failed: %s", exc)
     except TelegramError as exc:
         logger.debug("edit_text failed: %s", exc)
@@ -1244,14 +1273,33 @@ async def _send_chunks(
     text: str,
     bot: Bot,
     reply_to: int | None = None,
+    parse_mode: str | None = None,
 ) -> None:
-    """Send *text* split into chunks ≤ TELEGRAM_MAX_LENGTH."""
+    """Send *text* split into chunks ≤ TELEGRAM_MAX_LENGTH.
+
+    If *parse_mode* is supplied and Telegram rejects the formatting, retries
+    each chunk without parse_mode so the raw text is always delivered.
+    """
     chunks = split_message(text)
     for i, chunk in enumerate(chunks):
+        kwargs: dict = {"chat_id": chat_id, "text": chunk}
         if i == 0 and reply_to:
-            await bot.send_message(chat_id=chat_id, text=chunk, reply_to_message_id=reply_to)
-        else:
-            await bot.send_message(chat_id=chat_id, text=chunk)
+            kwargs["reply_to_message_id"] = reply_to
+        if parse_mode:
+            kwargs["parse_mode"] = parse_mode
+        try:
+            await bot.send_message(**kwargs)
+        except BadRequest as exc:
+            if parse_mode and _is_parse_error(exc):
+                plain = {k: v for k, v in kwargs.items() if k != "parse_mode"}
+                try:
+                    await bot.send_message(**plain)
+                except Exception as exc2:
+                    logger.warning("send_message (plain fallback) failed: %s", exc2)
+            else:
+                logger.warning("send_message failed: %s", exc)
+        except TelegramError as exc:
+            logger.warning("send_message failed: %s", exc)
 
 
 async def _stream_to_message(
@@ -1291,9 +1339,15 @@ async def _stream_to_message(
     # Final update — split if needed
     display = reply + _fallback_footer(model_used, preferred_model, is_fallback)
     chunks = split_message(display)
-    await _safe_edit_text(placeholder_msg, chunks[0])
+    await _safe_edit_text(placeholder_msg, chunks[0], parse_mode=ParseMode.MARKDOWN)
     for chunk in chunks[1:]:
-        await bot.send_message(chat_id=chat_id, text=chunk)
+        try:
+            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.MARKDOWN)
+        except BadRequest as exc:
+            if _is_parse_error(exc):
+                await bot.send_message(chat_id=chat_id, text=chunk)
+            else:
+                raise
 
     return reply, model_used, is_fallback
 
@@ -1393,7 +1447,10 @@ async def _on_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         reply, model_used, _ = await task
     except asyncio.CancelledError:
-        await context.bot.send_message(chat_id=chat_id, text="⛔ Your in-progress request has been cancelled.")
+        # Suppress the cancellation message when /followup silently redirected this request.
+        if user.id not in _silenced_cancels:
+            await context.bot.send_message(chat_id=chat_id, text="⛔ Your in-progress request has been cancelled.")
+        _silenced_cancels.discard(user.id)
         return
     finally:
         active_requests.pop(user.id, None)
@@ -1445,7 +1502,9 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         reply, model_used, _ = await task
     except asyncio.CancelledError:
-        await context.bot.send_message(chat_id=chat_id, text="⛔ Your in-progress request has been cancelled.")
+        if user.id not in _silenced_cancels:
+            await context.bot.send_message(chat_id=chat_id, text="⛔ Your in-progress request has been cancelled.")
+        _silenced_cancels.discard(user.id)
         return
     finally:
         active_requests.pop(user.id, None)
@@ -1483,27 +1542,22 @@ async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/settings [model:<model>] — view or set preferred AI model."""
+    """/settings [<model_name>] — view or set preferred AI model."""
     msg = update.effective_message
     user = update.effective_user
     if msg is None or user is None:
         return
     args = context.args or []
     if not args:
+        # Show inline keyboard for model selection
         current = user_preferred_models.get(user.id)
-        if current:
-            desc, vision = MODEL_INFO.get(current, ("Unknown model", False))
-            vtag = " [vision]" if vision else ""
-            await msg.reply_text(
-                f"Your preferred model is *{current}*{vtag} — {desc}.\n"
-                "Use `/settings <model_name>` to change it.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        else:
-            await msg.reply_text(
-                "No preferred model set — using automatic model selection.\n"
-                "Use `/settings <model_name>` to set one."
-            )
+        keyboard = _build_model_keyboard(current)
+        current_text = f"Current: *{current}*" if current else "No preference set (auto-select)"
+        await msg.reply_text(
+            f"⚙️ *Model Settings*\n{current_text}\n\nChoose your preferred model:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard,
+        )
         return
 
     model = args[0].strip()
@@ -1553,7 +1607,7 @@ async def company_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await msg.reply_text(header, parse_mode=ParseMode.MARKDOWN)
 
     async def _send(text: str) -> None:
-        await _send_chunks(chat_id, text, context.bot)
+        await _send_chunks(chat_id, text, context.bot, parse_mode=ParseMode.MARKDOWN)
 
     role_done_cb: Optional[Callable] = None
     posts_done_in_cb = False
@@ -1611,7 +1665,7 @@ async def build_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await msg.reply_text(header, parse_mode=ParseMode.MARKDOWN)
 
     async def _send(text: str) -> None:
-        await _send_chunks(chat_id, text, context.bot)
+        await _send_chunks(chat_id, text, context.bot, parse_mode=ParseMode.MARKDOWN)
 
     role_done_cb: Optional[Callable] = None
     posts_done_in_cb = False
@@ -1718,7 +1772,7 @@ async def autorun_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await context.bot.send_message(chat_id=chat_id, text=header, parse_mode=ParseMode.MARKDOWN)
 
         async def _send(text: str) -> None:
-            await _send_chunks(chat_id, text, context.bot)
+            await _send_chunks(chat_id, text, context.bot, parse_mode=ParseMode.MARKDOWN)
 
         async def _autorun_role_cb(role: str, reply: str) -> Optional[str]:
             role_idx = role_list.index(role)
@@ -1803,7 +1857,7 @@ async def company_roles_command(update: Update, context: ContextTypes.DEFAULT_TY
     chat = update.effective_chat
     if chat is None:
         return
-    await _send_chunks(chat.id, content, context.bot)
+    await _send_chunks(chat.id, content, context.bot, parse_mode=ParseMode.MARKDOWN)
 
 
 # ---------------------------------------------------------------------------
@@ -1829,6 +1883,8 @@ async def followup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # ── Priority 1: cancel any active streaming request and redirect it ────
     existing_task = active_requests.pop(user.id, None)
     if existing_task and not existing_task.done():
+        # Mark as silenced so the original handler won't send a duplicate cancel message.
+        _silenced_cancels.add(user.id)
         existing_task.cancel()
         history = conversation_history.get(chat_id, [])
         preferred = user_preferred_models.get(user.id)
@@ -1947,7 +2003,7 @@ async def _do_build_followup(
 
         followup_num = len(followup_history) + 1
         await bot.send_message(chat_id=chat_id, text=f"💬 *Follow-up #{followup_num}:* {request[:120]}", parse_mode=ParseMode.MARKDOWN)
-        await _send_chunks(chat_id, reply, bot)
+        await _send_chunks(chat_id, reply, bot, parse_mode=ParseMode.MARKDOWN)
 
         followup_history.append({"request": request, "reply": reply})
 
@@ -2063,7 +2119,7 @@ async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     suggestion = await get_weather_clothing_suggestion(weather)
     weather_msg = _build_weather_message(weather, suggestion)
-    await _send_chunks(chat.id, weather_msg, context.bot)
+    await _send_chunks(chat.id, weather_msg, context.bot, parse_mode=ParseMode.MARKDOWN)
 
 
 # ---------------------------------------------------------------------------
@@ -2124,7 +2180,7 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     chat = update.effective_chat
     if msg is None or chat is None:
         return
-    await _send_chunks(chat.id, _build_about_message(), context.bot)
+    await _send_chunks(chat.id, _build_about_message(), context.bot, parse_mode=ParseMode.MARKDOWN)
 
 
 # ---------------------------------------------------------------------------
@@ -2200,10 +2256,177 @@ async def _weather_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     weather_msg = _build_weather_message(weather, suggestion, header=header)
 
     try:
-        await _send_chunks(WEATHER_CHAT_ID, weather_msg, context.bot)
+        await _send_chunks(WEATHER_CHAT_ID, weather_msg, context.bot, parse_mode=ParseMode.MARKDOWN)
         logger.info("Weather reminder sent to chat %s", WEATHER_CHAT_ID)
     except Exception as exc:
         logger.warning("Weather reminder: failed to send message: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# /start — welcome screen with quick-action inline buttons
+# ---------------------------------------------------------------------------
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/start — welcome message with quick-action inline keyboard."""
+    msg = update.effective_message
+    if msg is None:
+        return
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("❓ /ask — Chat with AI", callback_data="cmd:ask"),
+            InlineKeyboardButton("🌤️ /weather", callback_data="cmd:weather"),
+        ],
+        [
+            InlineKeyboardButton("🏢 /company", callback_data="cmd:company"),
+            InlineKeyboardButton("🛠️ /build", callback_data="cmd:build"),
+        ],
+        [
+            InlineKeyboardButton("🤖 /autorun", callback_data="cmd:autorun"),
+            InlineKeyboardButton("⚙️ /settings", callback_data="cmd:settings"),
+        ],
+        [
+            InlineKeyboardButton("📋 /about — full help guide", callback_data="cmd:about"),
+        ],
+    ])
+    welcome = (
+        "🤖 *Welcome to the AI Bot!*\n\n"
+        "I can chat with you using powerful AI models, run multi-role company "
+        "discussions, build entire projects end-to-end, and fetch Hong Kong weather.\n\n"
+        "Just send me a message to start chatting, or tap a button below!"
+    )
+    await msg.reply_text(welcome, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+
+
+# ---------------------------------------------------------------------------
+# Inline-button callbacks: command shortcuts and model selection
+# ---------------------------------------------------------------------------
+
+_CMD_HINTS: dict[str, str] = {
+    "ask": (
+        "💬 *Chat / /ask*\n"
+        "Send me any message directly to chat, or use:\n"
+        "`/ask <your question>` — streaming AI reply\n"
+        "`/ask model:<name> <question>` — pick a specific model"
+    ),
+    "weather": (
+        "🌤️ */weather*\n"
+        "Fetches the current Hong Kong Observatory report and gives AI-powered clothing suggestions."
+    ),
+    "company": (
+        "🏢 */company <task>*\n"
+        "Runs a multi-role AI company discussion.\n"
+        "Optional: `roles:CEO,CTO,...` `interactive:true`\n\n"
+        "_Example:_ `/company Build a food delivery app`"
+    ),
+    "build": (
+        "🛠️ */build <task>*\n"
+        "AI developer team discussion + full code generation + optional GitHub commit.\n"
+        "Optional: `roles:CTO,BackendDev,...` `interactive:true`\n\n"
+        "_Example:_ `/build Create a REST API for a todo app`"
+    ),
+    "autorun": (
+        "🤖 */autorun*\n"
+        "Fully autonomous build — AI picks the task and builds it end-to-end.\n"
+        "Optional: `/autorun stack:python` (or `php`, `actions`)"
+    ),
+    "settings": (
+        "⚙️ */settings*\n"
+        "View or set your preferred AI model.\n"
+        "Use `/settings` to see the model picker, or `/settings <model_name>` directly."
+    ),
+    "about": None,  # handled specially — shows full about text
+}
+
+
+async def cmd_shortcut_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle quick-action button presses from the /start menu."""
+    query = update.callback_query
+    chat = update.effective_chat
+    if query is None or chat is None:
+        return
+    await query.answer()
+
+    data = query.data or ""
+    cmd = data.split(":", 1)[1] if ":" in data else ""
+
+    if cmd == "about":
+        await query.message.reply_text(
+            _build_about_message(), parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if cmd == "settings":
+        # Show the model selection keyboard inline
+        user = update.effective_user
+        current = user_preferred_models.get(user.id) if user else None
+        keyboard = _build_model_keyboard(current)
+        current_text = f"Current: *{current}*" if current else "No preference set (auto-select)"
+        await query.message.reply_text(
+            f"⚙️ *Model Settings*\n{current_text}\n\nChoose your preferred model:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard,
+        )
+        return
+
+    hint = _CMD_HINTS.get(cmd)
+    if hint:
+        await query.message.reply_text(hint, parse_mode=ParseMode.MARKDOWN)
+
+
+def _build_model_keyboard(current: str | None) -> InlineKeyboardMarkup:
+    """Build a 2-column inline keyboard for model selection."""
+    model_buttons: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for model in sorted(MODEL_INFO.keys()):
+        _, vision = MODEL_INFO[model]
+        vision_tag = "✅" if vision else "📝"
+        selected_tag = " ★" if model == current else ""
+        label = f"{vision_tag} {model}{selected_tag}"
+        row.append(InlineKeyboardButton(label, callback_data=f"set_model:{model}"))
+        if len(row) == 2:
+            model_buttons.append(row)
+            row = []
+    if row:
+        model_buttons.append(row)
+    model_buttons.append(
+        [InlineKeyboardButton("❌ Clear preference (auto-select)", callback_data="set_model:clear")]
+    )
+    return InlineKeyboardMarkup(model_buttons)
+
+
+async def model_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle model selection button presses (set_model:<name> or set_model:clear)."""
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+    await query.answer()
+
+    data = query.data or ""
+    model = data.split(":", 1)[1] if ":" in data else ""
+
+    if model == "clear":
+        user_preferred_models.pop(user.id, None)
+        await query.edit_message_text(
+            "✅ Preference cleared — using automatic model selection.\n"
+            "Use /settings to pick a model again.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if model not in ALL_MODELS:
+        await query.answer("Unknown model.", show_alert=True)
+        return
+
+    user_preferred_models[user.id] = model
+    desc, vision = MODEL_INFO.get(model, ("Unknown model", False))
+    vtag = " [vision]" if vision else ""
+    await query.edit_message_text(
+        f"✅ Preferred model set to *{model}*{vtag}\n_{desc}_\n\nUse /settings to change it.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2219,6 +2442,7 @@ def _build_application() -> Application:
     )
 
     # Commands
+    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("ask", ask_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("models", models_command))
@@ -2230,9 +2454,10 @@ def _build_application() -> Application:
     app.add_handler(CommandHandler("followup", followup_command))
     app.add_handler(CommandHandler("weather", weather_command))
     app.add_handler(CommandHandler("about", about_command))
-    app.add_handler(CommandHandler("start", about_command))
 
-    # Callback queries for interactive mode
+    # Callback queries for inline button interactions
+    app.add_handler(CallbackQueryHandler(model_select_callback, pattern=r"^set_model:"))
+    app.add_handler(CallbackQueryHandler(cmd_shortcut_callback, pattern=r"^cmd:"))
     app.add_handler(CallbackQueryHandler(interactive_callback_handler, pattern=r"^interactive_"))
 
     # Interactive input capture (group 0 — higher priority).
